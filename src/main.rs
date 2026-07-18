@@ -142,7 +142,10 @@ impl ApplicationHandler<AppEvent> for App {
             .with_icon(tray_icon_rgba())
             .build()
         {
-            Ok(tray) => self.tray = Some(tray),
+            Ok(tray) => {
+                self.tray = Some(tray);
+                launch::promote_tray_icon();
+            }
             Err(e) => eprintln!("sideQM: tray icon failed: {e}"),
         }
         let size = gfx::window_size(self.cfg.appearance.radius_px);

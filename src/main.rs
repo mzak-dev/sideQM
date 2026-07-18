@@ -77,7 +77,7 @@ impl App {
             return;
         }
         self.cfg_raw = raw.clone();
-        match serde_json::from_str::<Config>(&raw) {
+        match config::parse(&raw) {
             Ok(cfg) => {
                 hook::TRIGGER_XBUTTON.store(cfg.trigger_button.xbutton(), Ordering::Relaxed);
                 launch::set_autostart(cfg.autostart);
@@ -154,7 +154,10 @@ impl ApplicationHandler<AppEvent> for App {
             .with_visible(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(PhysicalSize::new(size, size))
-            .with_skip_taskbar(true);
+            .with_skip_taskbar(true)
+            // DirectComposition presents under the GDI redirection bitmap; drop it
+            // or the swapchain is invisible.
+            .with_no_redirection_bitmap(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("window creation"));
         apply_no_activate(&window);
         self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg));

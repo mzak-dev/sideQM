@@ -93,13 +93,18 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(appdata).join("sideQM").join("config.json")
 }
 
+/// Parse config JSON, tolerating a UTF-8 BOM (Notepad and PowerShell add one).
+pub fn parse(raw: &str) -> serde_json::Result<Config> {
+    serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+}
+
 /// Returns (config, raw file contents). Creates the file with defaults on first run.
 /// A file that exists but fails to parse is NEVER overwritten — we log and fall back
 /// to defaults in memory so the user can fix their edits.
 pub fn load() -> (Config, String) {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<Config>(&raw) {
+        Ok(raw) => match parse(&raw) {
             Ok(cfg) => (cfg, raw),
             Err(e) => {
                 eprintln!("sideQM: config parse error ({e}); using defaults until fixed");

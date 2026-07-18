@@ -74,11 +74,13 @@ fn fs_shape(in: ShapeOut) -> @location(0) vec4f {
 struct TexIn {
     @location(0) pos: vec2f,
     @location(1) half: vec2f,
+    @location(2) alpha: f32,
 }
 
 struct TexOut {
     @builtin(position) clip: vec4f,
     @location(0) uv: vec2f,
+    @location(1) alpha: f32,
 }
 
 @group(1) @binding(0) var icon_tex: texture_2d<f32>;
@@ -90,11 +92,13 @@ fn vs_tex(@builtin(vertex_index) vi: u32, in: TexIn) -> TexOut {
     var out: TexOut;
     out.clip = to_ndc(in.pos + c * in.half);
     out.uv = c * 0.5 + vec2f(0.5);
+    out.alpha = in.alpha;
     return out;
 }
 
 @fragment
 fn fs_tex(in: TexOut) -> @location(0) vec4f {
     let c = textureSample(icon_tex, icon_samp, in.uv);
-    return vec4f(c.rgb * c.a, c.a); // premultiplied
+    let a = c.a * in.alpha;
+    return vec4f(c.rgb * a, a); // premultiplied
 }

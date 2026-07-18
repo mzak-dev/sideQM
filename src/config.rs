@@ -7,7 +7,29 @@ pub struct Config {
     pub trigger_button: TriggerButton,
     pub autostart: bool,
     pub appearance: Appearance,
+    pub animation: Animation,
     pub items: Vec<Item>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct Animation {
+    /// Entrance duration per tile; 0 disables the open animation.
+    pub open_ms: u32,
+    /// Collective shrink+fade on close; 0 hides instantly.
+    pub close_ms: u32,
+    /// Per-slot delay during the staggered entrance.
+    pub stagger_ms: u32,
+    /// 0 = no overshoot, 1 = jelly. Maps to spring damping.
+    pub bounciness: f32,
+    /// Max Bulge scale of the tile under the cursor.
+    pub hover_scale: f32,
+}
+
+impl Default for Animation {
+    fn default() -> Self {
+        Self { open_ms: 250, close_ms: 140, stagger_ms: 25, bounciness: 0.4, hover_scale: 1.4 }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +81,7 @@ impl Default for Config {
             trigger_button: TriggerButton::Mouse5,
             autostart: false,
             appearance: Appearance::default(),
+            animation: Animation::default(),
             items: vec![
                 Item { name: "Terminal".into(), target: "wt.exe".into(), icon: None },
                 Item { name: "Files".into(), target: "explorer.exe".into(), icon: None },

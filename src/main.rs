@@ -46,6 +46,8 @@ struct App {
     tray: Option<TrayIcon>,
     /// Window center in global screen px, valid while shown.
     center: (f64, f64),
+    /// Last global cursor position seen; drives the Bulge.
+    last_cursor: (i32, i32),
     hover: Option<usize>,
     held: bool,
 }
@@ -105,18 +107,26 @@ impl App {
         let py = (y - size / 2).clamp(work.top, (work.bottom - size).max(work.top));
         window.set_outer_position(PhysicalPosition::new(px, py));
         self.center = ((px + size / 2) as f64, (py + size / 2) as f64);
+        self.last_cursor = (x, y);
         self.hover = None;
         self.held = true;
         hook::MENU_OPEN.store(true, Ordering::Relaxed);
         window.set_visible(true);
+        if let Some(g) = &mut self.gfx {
+            g.begin_open();
+        }
         window.request_redraw();
     }
 
+    /// Launch fires immediately; the window hides once the close animation ends.
     fn hide_menu_and_act(&mut self) {
         self.held = false;
         hook::MENU_OPEN.store(false, Ordering::Relaxed);
+        if let Some(g) = &mut self.gfx {
+            g.begin_close();
+        }
         if let Some(window) = &self.window {
-            window.set_visible(false);
+            window.request_redraw();
         }
         if let Some(k) = self.hover.take() {
             if k == self.cfg.items.len() {
@@ -186,18 +196,13 @@ impl ApplicationHandler<AppEvent> for App {
             }
             HookEvent::Move { x, y } => {
                 if self.held {
-                    let hover = gfx::hovered_item(
+                    self.last_cursor = (x, y);
+                    self.hover = gfx::hovered_item(
                         (x as f64, y as f64),
                         self.center,
                         self.total_slots(),
                         self.cfg.appearance.radius_px as f32,
                     );
-                    if hover != self.hover {
-                        self.hover = hover;
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
                 }
             }
             HookEvent::TriggerUp { x: _, y: _ } => {
@@ -230,8 +235,17 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(g) = &mut self.gfx {
-                    g.render(self.hover);
+                let cursor = (
+                    (self.last_cursor.0 as f64 - self.center.0) as f32,
+                    (self.last_cursor.1 as f64 - self.center.1) as f32,
+                );
+                if let (Some(g), Some(w)) = (&mut self.gfx, &self.window) {
+                    let tick = g.tick_render(cursor, self.hover);
+                    if tick.just_closed {
+                        w.set_visible(false);
+                    } else if tick.request_frame {
+                        w.request_redraw();
+                    }
                 }
             }
             _ => {}
@@ -293,6 +307,7 @@ fn main() {
         gfx: None,
         tray: None,
         center: (0.0, 0.0),
+        last_cursor: (0, 0),
         hover: None,
         held: false,
     };

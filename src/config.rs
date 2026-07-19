@@ -121,12 +121,14 @@ pub fn parse(raw: &str) -> serde_json::Result<Config> {
     serde_json::from_str(raw.trim_start_matches('\u{feff}'))
 }
 
-/// Returns (config, raw file contents). Creates the file with defaults on first run.
-/// A file that exists but fails to parse is NEVER overwritten — we log and fall back
-/// to defaults in memory so the user can fix their edits.
+/// Returns (config, raw file contents). Creates the file with defaults on first run,
+/// and also repopulates it if it exists but is empty (nothing to lose there).
+/// A file with actual content that fails to parse is NEVER overwritten — we log and
+/// fall back to defaults in memory so the user can fix their edits.
 pub fn load() -> (Config, String) {
     let path = config_path();
     match std::fs::read_to_string(&path) {
+        Ok(raw) if raw.trim().is_empty() => write_default(&path),
         Ok(raw) => match parse(&raw) {
             Ok(cfg) => (cfg, raw),
             Err(e) => {
@@ -134,16 +136,18 @@ pub fn load() -> (Config, String) {
                 (Config::default(), raw)
             }
         },
-        Err(_) => {
-            let cfg = Config::default();
-            let raw = serde_json::to_string_pretty(&cfg).unwrap();
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = std::fs::write(&path, &raw) {
-                eprintln!("sideQM: could not write default config: {e}");
-            }
-            (cfg, raw)
-        }
+        Err(_) => write_default(&path),
     }
+}
+
+fn write_default(path: &std::path::Path) -> (Config, String) {
+    let cfg = Config::default();
+    let raw = serde_json::to_string_pretty(&cfg).unwrap();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(path, &raw) {
+        eprintln!("sideQM: could not write default config: {e}");
+    }
+    (cfg, raw)
 }

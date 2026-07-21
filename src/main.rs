@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod config;
+mod geometry;
 mod gfx;
 mod hook;
 mod icons;
@@ -30,6 +32,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::Config;
+use crate::geometry::MenuGeometry;
 use crate::hook::HookEvent;
 
 #[derive(Debug)]
@@ -40,6 +43,8 @@ pub enum AppEvent {
 
 struct App {
     cfg: Config,
+    /// Rebuilt alongside cfg (startup + reload); the one source of Menu shape.
+    geo: MenuGeometry,
     cfg_raw: String,
     window: Option<Arc<Window>>,
     gfx: Option<gfx::Gfx>,
@@ -65,11 +70,6 @@ fn tray_icon_rgba() -> tray_icon::Icon {
 }
 
 impl App {
-    /// Total slots = configured items + the meta "Dodaj" slot (always last).
-    fn total_slots(&self) -> usize {
-        self.cfg.items.len() + 1
-    }
-
     fn reload_config(&mut self) {
         let path = config::config_path();
         let Ok(raw) = std::fs::read_to_string(&path) else { return };
@@ -81,15 +81,17 @@ impl App {
                 self.cfg_raw = raw;
                 hook::TRIGGER_XBUTTON.store(cfg.trigger_button.xbutton(), Ordering::Relaxed);
                 launch::set_autostart(cfg.autostart);
-                let new_size = window_size_for(&cfg);
-                if new_size != window_size_for(&self.cfg) {
+                let geo = MenuGeometry::new(&cfg.appearance, cfg.items.len());
+                if geo.window_size() != self.geo.window_size() {
                     if let Some(w) = &self.window {
-                        let _ = w.request_inner_size(PhysicalSize::new(new_size, new_size));
+                        let size = geo.window_size();
+                        let _ = w.request_inner_size(PhysicalSize::new(size, size));
                     }
                 }
+                self.geo = geo;
                 self.cfg = cfg;
                 if let Some(g) = &mut self.gfx {
-                    g.set_items(&self.cfg);
+                    g.set_items(&self.cfg, self.geo);
                 }
             }
             Err(e) => eprintln!("sideQM: config parse error ({e}); keeping previous config"),
@@ -126,7 +128,7 @@ impl App {
             window.request_redraw();
         }
         if let Some(k) = self.hover.take() {
-            if k == self.cfg.items.len() {
+            if k == self.geo.meta_slot() {
                 launch::open(&config::config_path().to_string_lossy());
             } else if let Some(item) = self.cfg.items.get(k) {
                 launch::open(&item.target);
@@ -155,7 +157,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             Err(e) => eprintln!("sideQM: tray icon failed: {e}"),
         }
-        let size = window_size_for(&self.cfg);
+        let size = self.geo.window_size();
         let attrs = Window::default_attributes()
             .with_title("sideQM")
             .with_decorations(false)
@@ -170,7 +172,7 @@ impl ApplicationHandler<AppEvent> for App {
             .with_no_redirection_bitmap(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("window creation"));
         apply_no_activate(&window);
-        self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg));
+        self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg, self.geo));
         self.window = Some(window);
     }
 
@@ -193,12 +195,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             HookEvent::Move { x, y } => {
                 if self.held {
-                    self.hover = gfx::hovered_item(
-                        (x as f64, y as f64),
-                        self.center,
-                        self.total_slots(),
-                        self.cfg.appearance.radius_px() as f32 * self.cfg.appearance.hub_ratio(),
-                    );
+                    self.hover = self.geo.hovered_slot((x as f64, y as f64), self.center);
                 }
             }
             HookEvent::TriggerUp { x: _, y: _ } => {
@@ -243,14 +240,6 @@ impl ApplicationHandler<AppEvent> for App {
             _ => {}
         }
     }
-}
-
-fn window_size_for(cfg: &Config) -> u32 {
-    gfx::window_size(
-        cfg.appearance.radius_px(),
-        cfg.appearance.tile_half(),
-        cfg.appearance.label_font_px(),
-    )
 }
 
 fn work_area_at(x: i32, y: i32) -> RECT {
@@ -300,8 +289,10 @@ fn main() {
         let _ = menu_proxy.send_event(AppEvent::Menu(ev));
     }));
 
+    let geo = MenuGeometry::new(&cfg.appearance, cfg.items.len());
     let mut app = App {
         cfg,
+        geo,
         cfg_raw,
         window: None,
         gfx: None,

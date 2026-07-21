@@ -46,13 +46,11 @@ struct App {
     tray: Option<TrayIcon>,
     /// Window center in global screen px, valid while shown.
     center: (f64, f64),
-    /// Last global cursor position seen; drives the Bulge.
-    last_cursor: (i32, i32),
     hover: Option<usize>,
     held: bool,
 }
 
-/// 32x32 green filled circle, the tray icon.
+/// 32x32 mint filled circle, the tray icon.
 fn tray_icon_rgba() -> tray_icon::Icon {
     const N: i32 = 32;
     let mut px = Vec::with_capacity((N * N * 4) as usize);
@@ -60,14 +58,14 @@ fn tray_icon_rgba() -> tray_icon::Icon {
         for x in 0..N {
             let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
             let inside = (dx * dx + dy * dy).sqrt() <= 14.0;
-            px.extend_from_slice(if inside { &[0x2e, 0xcc, 0x71, 0xff] } else { &[0, 0, 0, 0] });
+            px.extend_from_slice(if inside { &[0x5D, 0xCA, 0xA5, 0xff] } else { &[0, 0, 0, 0] });
         }
     }
     tray_icon::Icon::from_rgba(px, N as u32, N as u32).expect("tray icon")
 }
 
 impl App {
-    /// Total slots = configured items + the edit item (always last, at 6 o'clock).
+    /// Total slots = configured items + the meta "Dodaj" slot (always last).
     fn total_slots(&self) -> usize {
         self.cfg.items.len() + 1
     }
@@ -78,13 +76,13 @@ impl App {
         if raw == self.cfg_raw {
             return;
         }
-        self.cfg_raw = raw.clone();
-        match config::parse(&raw) {
-            Ok(cfg) => {
+        match config::parse_and_resync(&path, &raw) {
+            Ok((cfg, raw)) => {
+                self.cfg_raw = raw;
                 hook::TRIGGER_XBUTTON.store(cfg.trigger_button.xbutton(), Ordering::Relaxed);
                 launch::set_autostart(cfg.autostart);
-                let new_size = gfx::window_size(cfg.appearance.radius_px);
-                if new_size != gfx::window_size(self.cfg.appearance.radius_px) {
+                let new_size = window_size_for(&cfg);
+                if new_size != window_size_for(&self.cfg) {
                     if let Some(w) = &self.window {
                         let _ = w.request_inner_size(PhysicalSize::new(new_size, new_size));
                     }
@@ -107,7 +105,6 @@ impl App {
         let py = (y - size / 2).clamp(work.top, (work.bottom - size).max(work.top));
         window.set_outer_position(PhysicalPosition::new(px, py));
         self.center = ((px + size / 2) as f64, (py + size / 2) as f64);
-        self.last_cursor = (x, y);
         self.hover = None;
         self.held = true;
         hook::MENU_OPEN.store(true, Ordering::Relaxed);
@@ -123,7 +120,7 @@ impl App {
         self.held = false;
         hook::MENU_OPEN.store(false, Ordering::Relaxed);
         if let Some(g) = &mut self.gfx {
-            g.begin_close();
+            g.begin_close(self.hover);
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -158,7 +155,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             Err(e) => eprintln!("sideQM: tray icon failed: {e}"),
         }
-        let size = gfx::window_size(self.cfg.appearance.radius_px);
+        let size = window_size_for(&self.cfg);
         let attrs = Window::default_attributes()
             .with_title("sideQM")
             .with_decorations(false)
@@ -196,12 +193,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             HookEvent::Move { x, y } => {
                 if self.held {
-                    self.last_cursor = (x, y);
                     self.hover = gfx::hovered_item(
                         (x as f64, y as f64),
                         self.center,
                         self.total_slots(),
-                        self.cfg.appearance.radius_px as f32,
+                        self.cfg.appearance.radius_px() as f32 * self.cfg.appearance.hub_ratio(),
                     );
                 }
             }
@@ -235,12 +231,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let cursor = (
-                    (self.last_cursor.0 as f64 - self.center.0) as f32,
-                    (self.last_cursor.1 as f64 - self.center.1) as f32,
-                );
                 if let (Some(g), Some(w)) = (&mut self.gfx, &self.window) {
-                    let tick = g.tick_render(cursor, self.hover);
+                    let tick = g.tick_render(self.hover);
                     if tick.just_closed {
                         w.set_visible(false);
                     } else if tick.request_frame {
@@ -251,6 +243,14 @@ impl ApplicationHandler<AppEvent> for App {
             _ => {}
         }
     }
+}
+
+fn window_size_for(cfg: &Config) -> u32 {
+    gfx::window_size(
+        cfg.appearance.radius_px(),
+        cfg.appearance.tile_half(),
+        cfg.appearance.label_font_px(),
+    )
 }
 
 fn work_area_at(x: i32, y: i32) -> RECT {
@@ -307,7 +307,6 @@ fn main() {
         gfx: None,
         tray: None,
         center: (0.0, 0.0),
-        last_cursor: (0, 0),
         hover: None,
         held: false,
     };

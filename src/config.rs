@@ -147,6 +147,11 @@ fn parse_hex(s: &str) -> Option<[f32; 3]> {
 }
 
 pub fn config_path() -> PathBuf {
+    // Override for testing against a scratch config without touching the
+    // real one — same spirit as SIDEQM_AUTOSHOW/SIDEQM_BACKEND below.
+    if let Ok(p) = std::env::var("SIDEQM_CONFIG_PATH") {
+        return PathBuf::from(p);
+    }
     let appdata = std::env::var("APPDATA").expect("APPDATA not set");
     PathBuf::from(appdata).join("sideQM").join("config.json")
 }

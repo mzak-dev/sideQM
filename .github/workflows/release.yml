@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run tests
+      run: cargo test --release --verbose
+    - name: Build release binary
+      run: cargo build --release --verbose
+    - name: Create draft GitHub release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release create "${{ github.ref_name }}" target/release/sideqm.exe --draft --generate-notes --title "${{ github.ref_name }}"

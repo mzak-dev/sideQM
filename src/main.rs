@@ -173,10 +173,18 @@ impl App {
         let dist = self.geo.scrim_r() + popover::GAP + support;
         let work = work_area_at(self.center.0 as i32, self.center.1 as i32);
         let (pw2, ph2) = (popover::PANEL_W / 2.0, popover::PANEL_H / 2.0);
-        let sx = (self.center.0 as f32 + dx * dist)
-            .clamp(work.left as f32 + pw2 + 8.0, work.right as f32 - pw2 - 8.0);
-        let sy = (self.center.1 as f32 + dy * dist)
-            .clamp(work.top as f32 + ph2 + 8.0, work.bottom as f32 - ph2 - 8.0);
+        let sx = popover::clamp_panel_axis(
+            self.center.0 as f32 + dx * dist,
+            pw2,
+            work.left as f32 + 8.0,
+            work.right as f32 - 8.0,
+        );
+        let sy = popover::clamp_panel_axis(
+            self.center.1 as f32 + dy * dist,
+            ph2,
+            work.top as f32 + 8.0,
+            work.bottom as f32 - 8.0,
+        );
         let rel = [sx - self.center.0 as f32, sy - self.center.1 as f32];
 
         // Grow the window symmetrically so the panel fits; symmetric growth

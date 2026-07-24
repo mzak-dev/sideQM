@@ -311,6 +311,19 @@ impl Field {
     }
 }
 
+/// Place a panel's center on one axis so a panel of half-extent `half` stays
+/// within the work-area span `[lo, hi]`. When the span is narrower than the
+/// panel, center the panel instead — `f32::clamp` PANICS on an inverted range,
+/// which a tiny monitor or odd multi-monitor layout would otherwise trigger.
+pub fn clamp_panel_axis(desired: f32, half: f32, lo: f32, hi: f32) -> f32 {
+    let (min, max) = (lo + half, hi - half);
+    if min <= max {
+        desired.clamp(min, max)
+    } else {
+        (lo + hi) / 2.0
+    }
+}
+
 /// Name for an Item the user didn't name: URL host, else file stem, else the
 /// raw target. Always lowercased, like the rest of the Menu's text.
 pub fn fallback_name(target: &str) -> String {
@@ -410,5 +423,149 @@ mod tests {
         let mut s = state();
         assert_eq!(s.on_key(Key::Escape), Some(Action::Discard));
         assert_eq!(s.on_click(Element::Cancel), Some(Action::Discard));
+    }
+
+    /// The caret is a byte index into `text`; any op leaving it off a char
+    /// boundary or past the end makes the NEXT insert/remove panic. Hammer a
+    /// mixed sequence with multibyte text and assert the invariant every step.
+    #[test]
+    fn caret_never_leaves_a_valid_boundary() {
+        fn ok(f: &Field) {
+            assert!(f.caret <= f.text.len(), "caret {} > len {}", f.caret, f.text.len());
+            assert!(f.text.is_char_boundary(f.caret), "caret {} mid-char in {:?}", f.caret, f.text);
+        }
+        let mut f = Field::default();
+        // Backspace/delete/left/right on an empty field must not panic.
+        f.backspace();
+        f.delete();
+        f.left();
+        f.right();
+        ok(&f);
+        for chunk in ["ą", "b", "łóź", "😀", "x"] {
+            f.insert(chunk);
+            ok(&f);
+        }
+        // Walk left past the start, deleting as we go; then right past the end.
+        for _ in 0..20 {
+            f.left();
+            ok(&f);
+            f.delete();
+            ok(&f);
+        }
+        for _ in 0..20 {
+            f.right();
+            ok(&f);
+            f.backspace();
+            ok(&f);
+        }
+        assert_eq!(f.text, "");
+    }
+
+    #[test]
+    fn boundary_ops_are_noops_not_panics() {
+        let mut f = Field::default();
+        f.set("ab");
+        f.caret = f.text.len();
+        f.delete(); // at end: nothing to delete
+        f.right(); // at end: caret stays
+        assert_eq!((f.text.as_str(), f.caret), ("ab", 2));
+        f.caret = 0;
+        f.backspace(); // at start: nothing
+        f.left(); // at start: caret stays
+        assert_eq!((f.text.as_str(), f.caret), ("ab", 0));
+    }
+
+    #[test]
+    fn typing_in_target_does_not_block_name_autofill() {
+        // Only NAME edits count as "touched"; a target the user typed still
+        // leaves the name free for browse to auto-fill.
+        let mut s = state();
+        s.on_key(Key::Tab); // focus target
+        s.insert("C:/x");
+        assert!(!s.name_touched);
+        s.apply_picked_file(r"C:\Apps\Obsidian.exe");
+        assert_eq!(s.name.text, "obsidian");
+    }
+
+    #[test]
+    fn name_edit_then_clear_still_counts_as_touched() {
+        let mut s = state();
+        s.insert("m");
+        s.on_key(Key::Backspace); // name now empty but was touched
+        assert!(s.name.text.is_empty() && s.name_touched);
+        s.apply_picked_file(r"C:\Apps\Obsidian.exe");
+        assert_eq!(s.name.text, ""); // not overwritten
+    }
+
+    #[test]
+    fn apply_picked_file_tolerates_an_odd_path() {
+        let mut s = state();
+        s.apply_picked_file(r"C:\Apps\"); // trailing separator: no panic
+        assert_eq!(s.target.text, r"C:\Apps\");
+        // Whatever name got derived, target's caret must stay on a boundary.
+        assert!(s.target.text.is_char_boundary(s.target.caret));
+        // And an empty path must not panic either.
+        s.apply_picked_file("");
+        assert_eq!(s.target.text, "");
+    }
+
+    #[test]
+    fn whitespace_only_target_is_invalid() {
+        let mut s = state();
+        s.on_key(Key::Tab);
+        s.insert("   ");
+        assert!(!s.valid());
+        assert_eq!(s.on_key(Key::Enter), None);
+        assert_eq!(s.on_click(Element::Commit), None);
+    }
+
+    #[test]
+    fn fallback_name_edge_cases() {
+        assert_eq!(fallback_name(""), ""); // empty: file_stem is None, degrades to ""
+        assert_eq!(fallback_name("https://GitHub.com/"), "github.com"); // trailing slash + case
+        assert_eq!(fallback_name("ftp://host"), "host");
+    }
+
+    #[test]
+    fn every_layout_element_sits_inside_the_panel() {
+        let l = Layout::new([40.0, -30.0]); // non-origin: catch center-relative bugs
+        let p = l.panel;
+        for r in [
+            l.name_field,
+            l.target_field,
+            l.browse_btn,
+            l.icon_preview,
+            l.icon_btn,
+            l.commit_btn,
+            l.cancel_btn,
+        ] {
+            assert!(r.center[0] - r.half[0] >= p.center[0] - p.half[0], "off left");
+            assert!(r.center[0] + r.half[0] <= p.center[0] + p.half[0], "off right");
+            assert!(r.center[1] - r.half[1] >= p.center[1] - p.half[1], "off top");
+            assert!(r.center[1] + r.half[1] <= p.center[1] + p.half[1], "off bottom");
+        }
+    }
+
+    #[test]
+    fn adjacent_controls_do_not_overlap() {
+        let l = Layout::new([0.0, 0.0]);
+        let overlaps = |a: Rect, b: Rect| {
+            (a.center[0] - b.center[0]).abs() < a.half[0] + b.half[0]
+                && (a.center[1] - b.center[1]).abs() < a.half[1] + b.half[1]
+        };
+        // Pairs that share a row and would swallow each other's clicks if they overlapped.
+        assert!(!overlaps(l.commit_btn, l.cancel_btn));
+        assert!(!overlaps(l.target_field, l.browse_btn));
+        assert!(!overlaps(l.icon_preview, l.icon_btn));
+    }
+
+    #[test]
+    fn clamp_panel_axis_centers_when_the_area_is_too_small() {
+        // Roomy span: normal clamp keeps the panel off the edges.
+        assert_eq!(clamp_panel_axis(1000.0, 50.0, 0.0, 400.0), 350.0);
+        assert_eq!(clamp_panel_axis(-1000.0, 50.0, 0.0, 400.0), 50.0);
+        assert_eq!(clamp_panel_axis(200.0, 50.0, 0.0, 400.0), 200.0);
+        // Span narrower than the panel: center it (no inverted-range panic).
+        assert_eq!(clamp_panel_axis(9999.0, 200.0, 0.0, 100.0), 50.0);
     }
 }

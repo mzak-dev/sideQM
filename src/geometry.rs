@@ -206,6 +206,18 @@ mod tests {
         assert!(!g.in_gear_zone((50.0, 30.0), (0.0, 0.0)));
     }
 
+    #[test]
+    fn gear_zone_math_is_center_relative() {
+        // Same geometry as above but around a real on-screen center: the zone
+        // must track the center, not assume the Menu sits at the origin.
+        let g = geo(5); // hub_r = 40, cut at +24
+        let c = (1000.0, 500.0);
+        assert!(g.in_gear_zone((1000.0, 530.0), c)); // 30px below center
+        assert!(!g.in_gear_zone((1000.0, 500.0), c)); // at center
+        assert!(!g.in_gear_zone((1000.0, 470.0), c)); // above center
+        assert_eq!(g.hovered_slot((1000.0, 530.0), c), None); // still dead to launches
+    }
+
     fn angle_point(deg: f32, r: f32) -> (f64, f64) {
         let rad = deg.to_radians();
         (rad.cos() as f64 * r as f64, rad.sin() as f64 * r as f64)

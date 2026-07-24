@@ -29,4 +29,4 @@ jobs:
         if ($LASTEXITCODE -eq 0) { "Release $tag already exists - nothing to do"; exit 0 }
         $zip = "sideqm-$tag-windows-x64.zip"
         Compress-Archive -Path target/release/sideqm.exe, README.md -DestinationPath $zip
-        gh release create $tag $zip target/release/sideqm.exe --generate-notes --title $tag
+        gh release create $tag $zip target/release/sideqm.exe --target ${{ github.sha }} --generate-notes --title $tag

@@ -22,6 +22,8 @@ const SCRIM_GATE: f32 = 0.6;
 const ARC_RESPONSE_S: f32 = 0.45;
 /// Arc fade, in and out: critically damped.
 const ARC_FADE_S: f32 = 0.15;
+/// Popover expand/collapse spring, shares the open damping.
+const POPOVER_RESPONSE_S: f32 = 0.35;
 
 /// Damped spring toward a target; the whole animation system is these.
 #[derive(Clone, Copy, Default)]
@@ -47,7 +49,9 @@ enum Phase {
     Closed,
     /// Opening and open are one phase; the springs decide when motion stops.
     /// `elapsed` accumulates ticked `dt`, driving the Stagger and Scrim gate.
-    Shown { elapsed: f32 },
+    Shown {
+        elapsed: f32,
+    },
     Closing,
 }
 
@@ -67,6 +71,8 @@ pub struct FrameModel {
     pub arc: Option<(f32, f32)>,
     /// The Hover this frame was ticked with (drives select colors + Hub text).
     pub hovered: Option<usize>,
+    /// Popover expand progress, 0..~1 (can overshoot when bouncy).
+    pub popover: f32,
     /// Keep the redraw loop running. False also means: nothing to draw.
     pub request_frame: bool,
     /// The close animation just finished; hide the window now.
@@ -80,6 +86,7 @@ impl FrameModel {
             scrim: 0.0,
             arc: None,
             hovered,
+            popover: 0.0,
             request_frame: false,
             just_closed,
         }
@@ -105,6 +112,9 @@ pub struct Animator {
     /// Captured at begin_close so the launched tile can pop while everything
     /// else fades, even though `hover` itself is cleared right after.
     closing_launched: Option<usize>,
+    /// Popover expansion toward 1 while Pinned, back toward 0 otherwise.
+    popover_spring: Spring,
+    pinned: bool,
 }
 
 impl Animator {
@@ -120,7 +130,19 @@ impl Animator {
             arc_on: false,
             last_hover: None,
             closing_launched: None,
+            popover_spring: Spring::default(),
+            pinned: false,
         }
+    }
+
+    /// The Popover starts expanding out of the Dodaj Tile (Pinned state).
+    pub fn begin_pin(&mut self) {
+        self.pinned = true;
+    }
+
+    /// Pinned ended (commit, discard, or Trigger restart): collapse the Popover.
+    pub fn end_pin(&mut self) {
+        self.pinned = false;
     }
 
     /// Resize per-slot springs after the Slot count changed (config reload).
@@ -145,6 +167,8 @@ impl Animator {
             self.arc_on = false;
             self.last_hover = None;
             self.closing_launched = None;
+            self.popover_spring = Spring::default();
+            self.pinned = false;
         }
         self.phase = Phase::Shown { elapsed: 0.0 };
     }
@@ -248,7 +272,10 @@ impl Animator {
                         self.arc_target += delta;
                     } else {
                         self.arc_target = target_angle;
-                        self.arc_rot = Spring { x: target_angle, v: 0.0 };
+                        self.arc_rot = Spring {
+                            x: target_angle,
+                            v: 0.0,
+                        };
                         self.arc_on = true;
                     }
                 }
@@ -259,7 +286,20 @@ impl Animator {
         let omega_arc = 4.0 / (zeta_open * ARC_RESPONSE_S);
         let omega_arc_fade = 4.0 / ARC_FADE_S;
         self.arc_rot.tick(self.arc_target, omega_arc, zeta_open, dt);
-        self.arc_alpha.tick(if hover.is_some() { 1.0 } else { 0.0 }, omega_arc_fade, 1.0, dt);
+        self.arc_alpha.tick(
+            if hover.is_some() { 1.0 } else { 0.0 },
+            omega_arc_fade,
+            1.0,
+            dt,
+        );
+
+        let omega_popover = 4.0 / (zeta_open * POPOVER_RESPONSE_S);
+        self.popover_spring.tick(
+            if self.pinned { 1.0 } else { 0.0 },
+            omega_popover,
+            zeta_open,
+            dt,
+        );
 
         let slots = self
             .tile_springs
@@ -267,7 +307,10 @@ impl Animator {
             .zip(&self.select_springs)
             .map(|(tile, select)| {
                 let intro = tile.x.max(0.0);
-                SlotFrame { scale: intro * select.x, alpha: intro.clamp(0.0, 1.0) }
+                SlotFrame {
+                    scale: intro * select.x,
+                    alpha: intro.clamp(0.0, 1.0),
+                }
             })
             .collect();
         let arc_alpha = self.arc_alpha.x.clamp(0.0, 1.0);
@@ -276,6 +319,7 @@ impl Animator {
             scrim: self.scrim_spring.x,
             arc: (arc_alpha > 0.01).then_some((self.arc_rot.x, arc_alpha)),
             hovered: hover,
+            popover: self.popover_spring.x.max(0.0),
             request_frame: true,
             just_closed: false,
         }
@@ -293,7 +337,13 @@ mod tests {
     }
 
     fn cfg() -> Animation {
-        Animation { open_ms: 480, close_ms: 180, stagger_ms: 100, bounciness: 0.0, hover_scale: 1.16 }
+        Animation {
+            open_ms: 480,
+            close_ms: 180,
+            stagger_ms: 100,
+            bounciness: 0.0,
+            hover_scale: 1.16,
+        }
     }
 
     fn opened(n_slots: usize) -> Animator {
@@ -304,7 +354,13 @@ mod tests {
     }
 
     /// Tick in fixed 10ms steps for `secs`, returning the last frame.
-    fn run(a: &mut Animator, g: &MenuGeometry, c: &Animation, hover: Option<usize>, secs: f32) -> FrameModel {
+    fn run(
+        a: &mut Animator,
+        g: &MenuGeometry,
+        c: &Animation,
+        hover: Option<usize>,
+        secs: f32,
+    ) -> FrameModel {
         let steps = (secs / 0.01).round() as usize;
         let mut last = a.tick(0.0, hover, g, c);
         for _ in 0..steps {
@@ -338,7 +394,10 @@ mod tests {
     #[test]
     fn instant_open_skips_the_entrance() {
         let g = geo(3);
-        let c = Animation { open_ms: 0, ..cfg() };
+        let c = Animation {
+            open_ms: 0,
+            ..cfg()
+        };
         let mut a = opened(4);
         let frame = a.tick(0.01, None, &g, &c);
         assert!(frame.slots.iter().all(|s| s.alpha == 1.0));
@@ -361,7 +420,10 @@ mod tests {
     #[test]
     fn close_reports_just_closed_exactly_once() {
         let g = geo(3);
-        let c = Animation { close_ms: 0, ..cfg() };
+        let c = Animation {
+            close_ms: 0,
+            ..cfg()
+        };
         let mut a = opened(4);
         a.tick(0.01, None, &g, &cfg());
         a.begin_close(None);
@@ -371,6 +433,19 @@ mod tests {
         let after = a.tick(0.01, None, &g, &c);
         assert!(!after.just_closed);
         assert!(!after.request_frame);
+    }
+
+    #[test]
+    fn popover_spring_expands_while_pinned_and_collapses_after() {
+        let (g, c) = (geo(3), cfg());
+        let mut a = opened(4);
+        assert_eq!(run(&mut a, &g, &c, None, 0.5).popover, 0.0);
+        a.begin_pin();
+        let frame = run(&mut a, &g, &c, None, 1.5);
+        assert!((frame.popover - 1.0).abs() < 0.05);
+        a.end_pin();
+        let frame = run(&mut a, &g, &c, None, 1.5);
+        assert!(frame.popover < 0.05);
     }
 
     #[test]

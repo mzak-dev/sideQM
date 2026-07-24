@@ -2,28 +2,33 @@
 
 mod anim;
 mod config;
+mod dialog;
 mod geometry;
 mod gfx;
 mod hook;
 mod icons;
 mod launch;
+mod popover;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use windows::core::w;
-use windows::Win32::Foundation::{GetLastError, HWND, POINT, RECT, ERROR_ALREADY_EXISTS};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GWL_EXSTYLE, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
+use windows::core::w;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
@@ -53,6 +58,17 @@ struct App {
     center: (f64, f64),
     hover: Option<usize>,
     held: bool,
+    /// The Gear zone (Hub's bottom segment) is under the cursor.
+    gear_hover: bool,
+    /// Pinned state: the add-item Popover is open; Some while it lives.
+    pinned: Option<popover::PopoverState>,
+    /// A modal file dialog is up: suppress the focus-loss discard.
+    in_dialog: bool,
+    /// Cursor position relative to the Menu center (window px), while Pinned.
+    cursor_rel: (f32, f32),
+    modifiers: ModifiersState,
+    /// (target, icon_override) last probed for the Popover's icon preview.
+    icon_probe: Option<(String, Option<String>)>,
 }
 
 /// 32x32 mint filled circle, the tray icon.
@@ -63,7 +79,11 @@ fn tray_icon_rgba() -> tray_icon::Icon {
         for x in 0..N {
             let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
             let inside = (dx * dx + dy * dy).sqrt() <= 14.0;
-            px.extend_from_slice(if inside { &[0x5D, 0xCA, 0xA5, 0xff] } else { &[0, 0, 0, 0] });
+            px.extend_from_slice(if inside {
+                &[0x5D, 0xCA, 0xA5, 0xff]
+            } else {
+                &[0, 0, 0, 0]
+            });
         }
     }
     tray_icon::Icon::from_rgba(px, N as u32, N as u32).expect("tray icon")
@@ -72,7 +92,9 @@ fn tray_icon_rgba() -> tray_icon::Icon {
 impl App {
     fn reload_config(&mut self) {
         let path = config::config_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else { return };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
         if raw == self.cfg_raw {
             return;
         }
@@ -108,6 +130,7 @@ impl App {
         window.set_outer_position(PhysicalPosition::new(px, py));
         self.center = ((px + size / 2) as f64, (py + size / 2) as f64);
         self.hover = None;
+        self.gear_hover = false;
         self.held = true;
         hook::MENU_OPEN.store(true, Ordering::Relaxed);
         window.set_visible(true);
@@ -117,23 +140,202 @@ impl App {
         window.request_redraw();
     }
 
-    /// Launch fires immediately; the window hides once the close animation ends.
-    fn hide_menu_and_act(&mut self) {
+    /// Cosmetic close: launching (if any) already happened at the call site;
+    /// the window hides once the close animation ends.
+    fn close_menu(&mut self, launched: Option<usize>) {
         self.held = false;
+        self.hover = None;
+        self.gear_hover = false;
         hook::MENU_OPEN.store(false, Ordering::Relaxed);
         if let Some(g) = &mut self.gfx {
-            g.begin_close(self.hover);
+            g.begin_close(launched);
         }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
-        if let Some(k) = self.hover.take() {
-            if k == self.geo.meta_slot() {
-                launch::open(&config::config_path().to_string_lossy());
-            } else if let Some(item) = self.cfg.items.get(k) {
-                launch::open(&item.target);
+    }
+
+    /// Enter Pinned: the Menu stays up, the window becomes activatable and
+    /// focused, and the add-item Popover expands out of the Dodaj Tile.
+    fn pin(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        self.held = false;
+        self.hover = None;
+        self.gear_hover = false;
+        hook::MENU_OPEN.store(false, Ordering::Relaxed);
+
+        // Panel placement: radially outward from the Dodaj Tile, kept on-screen.
+        let a = self.geo.slot_angle(self.geo.meta_slot());
+        let (dx, dy) = (a.cos(), a.sin());
+        let support = dx.abs() * popover::PANEL_W / 2.0 + dy.abs() * popover::PANEL_H / 2.0;
+        let dist = self.geo.scrim_r() + popover::GAP + support;
+        let work = work_area_at(self.center.0 as i32, self.center.1 as i32);
+        let (pw2, ph2) = (popover::PANEL_W / 2.0, popover::PANEL_H / 2.0);
+        let sx = (self.center.0 as f32 + dx * dist)
+            .clamp(work.left as f32 + pw2 + 8.0, work.right as f32 - pw2 - 8.0);
+        let sy = (self.center.1 as f32 + dy * dist)
+            .clamp(work.top as f32 + ph2 + 8.0, work.bottom as f32 - ph2 - 8.0);
+        let rel = [sx - self.center.0 as f32, sy - self.center.1 as f32];
+
+        // Grow the window symmetrically so the panel fits; symmetric growth
+        // keeps the drawn Menu center on the same screen pixel.
+        let cur = window.inner_size().width;
+        let reach = (rel[0].abs() + pw2).max(rel[1].abs() + ph2) + 8.0;
+        let need = ((reach * 2.0).ceil() as u32 + 1) & !1;
+        if need > cur {
+            if let Ok(pos) = window.outer_position() {
+                let delta = ((need - cur) / 2) as i32;
+                window.set_outer_position(PhysicalPosition::new(pos.x - delta, pos.y - delta));
+            }
+            let _ = window.request_inner_size(PhysicalSize::new(need, need));
+        }
+
+        set_no_activate(&window, false);
+        if let Some(hwnd) = hwnd_of(&window) {
+            unsafe {
+                let _ = SetForegroundWindow(hwnd);
             }
         }
+        window.focus_window();
+        window.set_ime_allowed(true);
+
+        let origin = [dx * self.geo.rest_r(), dy * self.geo.rest_r()];
+        self.pinned = Some(popover::PopoverState::new(
+            popover::Layout::new(rel),
+            origin,
+        ));
+        if let Some(g) = &mut self.gfx {
+            g.begin_pin();
+        }
+        self.icon_probe = None;
+        self.refresh_popover_icon();
+        window.request_redraw();
+    }
+
+    /// Leave Pinned; `and_close` also plays the normal close animation.
+    fn unpin(&mut self, and_close: bool) {
+        if let Some(window) = &self.window {
+            set_no_activate(window, true);
+            window.set_ime_allowed(false);
+        }
+        self.pinned = None;
+        if let Some(g) = &mut self.gfx {
+            g.end_pin();
+        }
+        if and_close {
+            self.close_menu(None);
+        }
+    }
+
+    fn popover_action(&mut self, action: popover::Action) {
+        match action {
+            popover::Action::Discard => self.unpin(true),
+            popover::Action::Commit => {
+                if let Some(ps) = &self.pinned {
+                    let item = config::Item {
+                        name: ps.final_name(),
+                        target: ps.target.text.trim().to_string(),
+                        icon: ps.icon_override.clone(),
+                    };
+                    if let Err(e) = config::append_item(item, &self.cfg) {
+                        eprintln!("sideQM: could not save the new item: {e}");
+                    }
+                }
+                self.unpin(true);
+            }
+            popover::Action::Browse | popover::Action::BrowseIcon => {
+                let images = action == popover::Action::BrowseIcon;
+                let Some(hwnd) = self.window.as_deref().and_then(hwnd_of) else {
+                    return;
+                };
+                // Blocking modal dialog; in_dialog suppresses the Focused(false)
+                // discard that the dialog taking focus would otherwise fire.
+                self.in_dialog = true;
+                let picked = dialog::pick_file(hwnd, images);
+                self.in_dialog = false;
+                if let Some(w) = &self.window {
+                    w.focus_window();
+                }
+                if let Some(path) = picked {
+                    let path = path.to_string_lossy().to_string();
+                    if let Some(ps) = &mut self.pinned {
+                        if images {
+                            ps.icon_override = Some(path);
+                            ps.generation += 1;
+                        } else {
+                            ps.apply_picked_file(&path);
+                        }
+                    }
+                    self.refresh_popover_icon();
+                }
+            }
+        }
+    }
+
+    fn popover_key(&mut self, event: &KeyEvent) {
+        use winit::keyboard::{Key as WKey, NamedKey};
+        let mapped = match &event.logical_key {
+            WKey::Named(NamedKey::Escape) => Some(popover::Key::Escape),
+            WKey::Named(NamedKey::Enter) => Some(popover::Key::Enter),
+            WKey::Named(NamedKey::Tab) => Some(popover::Key::Tab),
+            WKey::Named(NamedKey::Backspace) => Some(popover::Key::Backspace),
+            WKey::Named(NamedKey::Delete) => Some(popover::Key::Delete),
+            WKey::Named(NamedKey::ArrowLeft) => Some(popover::Key::Left),
+            WKey::Named(NamedKey::ArrowRight) => Some(popover::Key::Right),
+            WKey::Named(NamedKey::Home) => Some(popover::Key::Home),
+            WKey::Named(NamedKey::End) => Some(popover::Key::End),
+            _ => None,
+        };
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let mut action = None;
+        if let Some(ps) = &mut self.pinned {
+            if let Some(k) = mapped {
+                action = ps.on_key(k);
+            } else if ctrl && !alt {
+                // Plain Ctrl shortcuts. AltGr arrives as Ctrl+Alt and falls
+                // through to the text branch, so Polish diacritics still type.
+                if matches!(&event.logical_key, WKey::Character(c) if c.eq_ignore_ascii_case("v"))
+                    && let Some(text) = dialog::clipboard_text()
+                {
+                    ps.insert(&text);
+                }
+            } else if let Some(text) = &event.text {
+                let s: String = text.chars().filter(|c| !c.is_control()).collect();
+                if !s.is_empty() {
+                    ps.insert(&s);
+                }
+            }
+        }
+        self.refresh_popover_icon();
+        if let Some(a) = action {
+            self.popover_action(a);
+        }
+    }
+
+    /// Re-extract the Popover's icon preview when its inputs changed.
+    fn refresh_popover_icon(&mut self) {
+        let Some(ps) = &self.pinned else { return };
+        let key = (ps.target.text.trim().to_string(), ps.icon_override.clone());
+        if self.icon_probe.as_ref() == Some(&key) {
+            return;
+        }
+        let icon = if key.0.is_empty() && key.1.is_none() {
+            None
+        } else {
+            icons::icon_for(&config::Item {
+                name: String::new(),
+                target: key.0.clone(),
+                icon: key.1.clone(),
+            })
+        };
+        let fallback = ps.final_name().chars().next().unwrap_or('?');
+        if let Some(g) = &mut self.gfx {
+            g.set_popover_icon(icon.as_ref(), fallback);
+        }
+        self.icon_probe = Some(key);
     }
 }
 
@@ -171,7 +373,7 @@ impl ApplicationHandler<AppEvent> for App {
             // or the swapchain is invisible.
             .with_no_redirection_bitmap(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("window creation"));
-        apply_no_activate(&window);
+        set_no_activate(&window, true);
         self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg, self.geo));
         self.window = Some(window);
     }
@@ -191,17 +393,40 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             HookEvent::TriggerDown { x, y } => {
                 println!("trigger down at ({x}, {y})");
+                // Pressing the Trigger while Pinned discards the Popover and
+                // starts a fresh press-and-hold Menu at the cursor.
+                if self.pinned.is_some() {
+                    self.unpin(false);
+                }
                 self.show_menu(x, y);
             }
             HookEvent::Move { x, y } => {
                 if self.held {
-                    self.hover = self.geo.hovered_slot((x as f64, y as f64), self.center);
+                    let cur = (x as f64, y as f64);
+                    self.hover = self.geo.hovered_slot(cur, self.center);
+                    self.gear_hover =
+                        self.hover.is_none() && self.geo.in_gear_zone(cur, self.center);
                 }
             }
             HookEvent::TriggerUp { x: _, y: _ } => {
                 if self.held {
                     println!("trigger up, hover = {:?}", self.hover);
-                    self.hide_menu_and_act();
+                    match self.hover.take() {
+                        // Release over Dodaj: pin the Menu, open the Popover.
+                        Some(k) if k == self.geo.meta_slot() => self.pin(),
+                        Some(k) => {
+                            if let Some(item) = self.cfg.items.get(k) {
+                                launch::open(&item.target);
+                            }
+                            self.close_menu(Some(k));
+                        }
+                        // Gear zone: the old "edit the JSON" path.
+                        None if self.gear_hover => {
+                            launch::open(&config::config_path().to_string_lossy());
+                            self.close_menu(None);
+                        }
+                        None => self.close_menu(None),
+                    }
                 }
             }
         }
@@ -209,7 +434,7 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Debug aid: show the menu without any hook involvement.
-        if std::env::var_os("SIDEQM_AUTOSHOW").is_some() && !self.held {
+        if std::env::var_os("SIDEQM_AUTOSHOW").is_some() && !self.held && self.pinned.is_none() {
             self.show_menu(960, 540);
         }
     }
@@ -227,11 +452,69 @@ impl ApplicationHandler<AppEvent> for App {
                     g.resize(size.width, size.height);
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::Focused(false) => {
+                // Clicking away (or alt-tab) while Pinned discards — unless the
+                // focus went to our own modal file dialog.
+                if self.pinned.is_some() && !self.in_dialog {
+                    self.unpin(true);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let (Some(ps), Some(w)) = (&mut self.pinned, &self.window) {
+                    let half = w.inner_size().width as f64 / 2.0;
+                    let rel = ((position.x - half) as f32, (position.y - half) as f32);
+                    self.cursor_rel = rel;
+                    ps.hover = ps.layout.hit(rel);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(ps) = &mut self.pinned {
+                    let rel = self.cursor_rel;
+                    let action = match ps.layout.hit(rel) {
+                        Some(el) => ps.on_click(el),
+                        None => {
+                            let in_menu = rel.0 * rel.0 + rel.1 * rel.1
+                                < self.geo.scrim_r() * self.geo.scrim_r();
+                            let in_panel = ps.layout.panel.contains(rel);
+                            (!in_menu && !in_panel).then_some(popover::Action::Discard)
+                        }
+                    };
+                    if let Some(a) = action {
+                        self.popover_action(a);
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if self.pinned.is_some() && event.state == ElementState::Pressed {
+                    self.popover_key(&event);
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(s)) => {
+                if let Some(ps) = &mut self.pinned {
+                    ps.insert(&s);
+                    self.refresh_popover_icon();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let (Some(g), Some(w)) = (&mut self.gfx, &self.window) {
-                    let tick = g.tick_render(self.hover);
+                    let view = gfx::MenuView {
+                        hover: self.hover,
+                        gear_hover: self.gear_hover,
+                        popover: self.pinned.as_ref(),
+                    };
+                    let tick = g.tick_render(&view);
                     if tick.just_closed {
                         w.set_visible(false);
+                        // Shed any Pinned-time growth while nobody's looking.
+                        let size = self.geo.window_size();
+                        if w.inner_size().width != size {
+                            let _ = w.request_inner_size(PhysicalSize::new(size, size));
+                        }
                     } else if tick.request_frame {
                         w.request_redraw();
                     }
@@ -254,17 +537,24 @@ fn work_area_at(x: i32, y: i32) -> RECT {
     }
 }
 
-fn apply_no_activate(window: &Window) {
-    let Ok(handle) = window.window_handle() else { return };
-    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
-    let hwnd = HWND(h.hwnd.get() as *mut _);
+fn hwnd_of(window: &Window) -> Option<HWND> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return None;
+    };
+    Some(HWND(h.hwnd.get() as *mut _))
+}
+
+/// Toggle WS_EX_NOACTIVATE (always keeping WS_EX_TOOLWINDOW): on for the
+/// press-and-hold Menu (never steals focus), off while Pinned (the Popover
+/// needs keyboard focus).
+fn set_no_activate(window: &Window, on: bool) {
+    let Some(hwnd) = hwnd_of(window) else { return };
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize,
-        );
+        let na = WS_EX_NOACTIVATE.0 as isize;
+        let ex = if on { ex | na } else { ex & !na };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW.0 as isize);
     }
 }
 
@@ -274,6 +564,12 @@ fn main() {
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         eprintln!("sideQM is already running");
         return;
+    }
+
+    // COM apartment for the Popover's IFileOpenDialog; S_FALSE (already
+    // initialized) is fine, so the result is deliberately ignored.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 
     let (cfg, cfg_raw) = config::load();
@@ -300,6 +596,12 @@ fn main() {
         center: (0.0, 0.0),
         hover: None,
         held: false,
+        gear_hover: false,
+        pinned: None,
+        in_dialog: false,
+        cursor_rel: (0.0, 0.0),
+        modifiers: ModifiersState::default(),
+        icon_probe: None,
     };
     event_loop.run_app(&mut app).expect("event loop run");
 }

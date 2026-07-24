@@ -73,6 +73,21 @@ impl MenuGeometry {
         k as f32 * TAU / self.slot_count as f32 - FRAC_PI_2
     }
 
+    /// Gear zone chord: local y-offset from the Menu center (screen y down)
+    /// cutting off the bottom 20% of the Hub's height (2 * hub_r).
+    pub fn gear_cut_dy(&self) -> f32 {
+        self.hub_r() * 0.6
+    }
+
+    /// Inside the Gear zone: the Hub's bottom circle segment, below the chord.
+    /// Releasing the Trigger here opens config.json; the rest of the Hub stays
+    /// the Dead zone.
+    pub fn in_gear_zone(&self, cursor: (f64, f64), center: (f64, f64)) -> bool {
+        let (dx, dy) = ((cursor.0 - center.0) as f32, (cursor.1 - center.1) as f32);
+        let hub_r = self.hub_r();
+        dx * dx + dy * dy < hub_r * hub_r && dy > self.gear_cut_dy()
+    }
+
     /// Which Slot the cursor Hovers, if any.
     ///
     /// The whole wedge is the target: there's no outer edge where selection
@@ -158,8 +173,14 @@ mod tests {
     #[test]
     fn generic_slot_count() {
         // N != 5 still divides the circle evenly (120 degree slots here).
-        assert_eq!(geo(3).hovered_slot(angle_point(-90.0, 200.0), (0.0, 0.0)), Some(0));
-        assert_eq!(geo(3).hovered_slot(angle_point(-90.0 + 120.0, 200.0), (0.0, 0.0)), Some(1));
+        assert_eq!(
+            geo(3).hovered_slot(angle_point(-90.0, 200.0), (0.0, 0.0)),
+            Some(0)
+        );
+        assert_eq!(
+            geo(3).hovered_slot(angle_point(-90.0 + 120.0, 200.0), (0.0, 0.0)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -170,6 +191,19 @@ mod tests {
         let just_outside = (0.0, -(g.hub_r() as f64) - 1.0);
         assert_eq!(g.hovered_slot(just_inside, (0.0, 0.0)), None);
         assert_eq!(g.hovered_slot(just_outside, (0.0, 0.0)), Some(0));
+    }
+
+    #[test]
+    fn gear_zone_is_the_hub_bottom_segment() {
+        let g = geo(5); // hub_r = 40, cut at +24
+        // Bottom of the hub: in the gear zone, and never a slot hover.
+        assert!(g.in_gear_zone((0.0, 30.0), (0.0, 0.0)));
+        assert_eq!(g.hovered_slot((0.0, 30.0), (0.0, 0.0)), None);
+        // Hub center and just above the chord: dead zone, not gear.
+        assert!(!g.in_gear_zone((0.0, 0.0), (0.0, 0.0)));
+        assert!(!g.in_gear_zone((0.0, 23.0), (0.0, 0.0)));
+        // Below the chord line but outside the hub circle: not gear.
+        assert!(!g.in_gear_zone((50.0, 30.0), (0.0, 0.0)));
     }
 
     fn angle_point(deg: f32, r: f32) -> (f64, f64) {

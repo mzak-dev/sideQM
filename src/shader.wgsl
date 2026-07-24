@@ -27,8 +27,9 @@ struct ShapeIn {
     @location(3) border: f32,         // border thickness, px (0 = none; arc: stroke half-width)
     @location(4) fill: vec4f,
     @location(5) border_color: vec4f,
-    @location(6) kind: f32,           // 0 = rounded box, 1 = arc stroke
+    @location(6) kind: f32,           // 0 = rounded box, 1 = arc stroke, 2 = circle segment
     @location(7) angle_center: f32,   // arc: pointing angle, radians (atan2 screen convention)
+                                      // segment: chord y-offset from center, px (+down)
     @location(8) angle_half: f32,     // arc: half angular width, radians
     @location(9) dash: f32,           // box only: > 0 = dash count around the border
 }
@@ -85,6 +86,15 @@ fn sd_arc(p: vec2f, angle_center: f32, angle_half: f32, radius: f32) -> f32 {
 
 @fragment
 fn fs_shape(in: ShapeOut) -> @location(0) vec4f {
+    if (in.kind > 1.5) {
+        // Circle segment: the disc of radius half.x, cut by a horizontal chord
+        // at local y = angle_center; only the part below the chord remains.
+        let d = max(length(in.local) - in.half.x, in.angle_center - in.local.y);
+        let aa = max(fwidth(d), 0.001);
+        let coverage = 1.0 - smoothstep(-aa, aa, d);
+        let a = in.fill.a * coverage;
+        return vec4f(in.fill.rgb * a, a); // premultiplied
+    }
     if (in.kind > 0.5) {
         let d = sd_arc(in.local, in.angle_center, in.angle_half, in.half.x) - in.border;
         let aa = max(fwidth(d), 0.001);

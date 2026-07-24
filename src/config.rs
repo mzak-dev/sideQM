@@ -28,7 +28,13 @@ pub struct Animation {
 
 impl Default for Animation {
     fn default() -> Self {
-        Self { open_ms: 480, close_ms: 180, stagger_ms: 36, bounciness: 0.7, hover_scale: 1.16 }
+        Self {
+            open_ms: 480,
+            close_ms: 180,
+            stagger_ms: 36,
+            bounciness: 0.7,
+            hover_scale: 1.16,
+        }
     }
 }
 
@@ -124,10 +130,26 @@ impl Default for Config {
             appearance: Appearance::default(),
             animation: Animation::default(),
             items: vec![
-                Item { name: "Terminal".into(), target: "wt.exe".into(), icon: None },
-                Item { name: "Files".into(), target: "explorer.exe".into(), icon: None },
-                Item { name: "Browser".into(), target: "https://google.com".into(), icon: None },
-                Item { name: "Notepad".into(), target: "notepad.exe".into(), icon: None },
+                Item {
+                    name: "Terminal".into(),
+                    target: "wt.exe".into(),
+                    icon: None,
+                },
+                Item {
+                    name: "Files".into(),
+                    target: "explorer.exe".into(),
+                    icon: None,
+                },
+                Item {
+                    name: "Browser".into(),
+                    target: "https://google.com".into(),
+                    icon: None,
+                },
+                Item {
+                    name: "Notepad".into(),
+                    target: "notepad.exe".into(),
+                    icon: None,
+                },
             ],
         }
     }
@@ -202,6 +224,27 @@ pub fn load() -> (Config, String) {
     }
 }
 
+/// Append one Item to config.json (the Popover's commit). Fresh-reads the
+/// file so concurrent hand-edits survive; if the on-disk file doesn't parse,
+/// falls back to the caller's last-good config rather than losing the add.
+/// Canonical pretty format — the next load's resync is a no-op.
+pub fn append_item(item: Item, last_good: &Config) -> std::io::Result<()> {
+    append_item_at(&config_path(), item, last_good)
+}
+
+fn append_item_at(path: &std::path::Path, item: Item, last_good: &Config) -> std::io::Result<()> {
+    let mut cfg = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| parse(&raw).ok())
+        .unwrap_or_else(|| last_good.clone());
+    cfg.items.push(item);
+    let raw = serde_json::to_string_pretty(&cfg).unwrap();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(path, raw)
+}
+
 fn write_default(path: &std::path::Path) -> (Config, String) {
     let cfg = Config::default();
     let raw = serde_json::to_string_pretty(&cfg).unwrap();
@@ -228,7 +271,10 @@ mod tests {
     fn partial_fields_keep_the_rest_at_default() {
         let cfg = parse(r#"{"appearance":{"radius_px":500}}"#).unwrap();
         assert_eq!(cfg.appearance.radius_px, 500);
-        assert_eq!(cfg.appearance.accent_color, Appearance::default().accent_color);
+        assert_eq!(
+            cfg.appearance.accent_color,
+            Appearance::default().accent_color
+        );
         assert!(cfg.animation == Animation::default());
     }
 
@@ -250,6 +296,38 @@ mod tests {
         // re-running on the now-canonical text is a no-op: no further rewrite
         let (_, raw2) = parse_and_resync(&path, &raw).unwrap();
         assert_eq!(raw2, raw);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_item_round_trips_and_survives_a_broken_file() {
+        let dir = std::env::temp_dir().join(format!("sideqm-test-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let base = Config::default();
+        std::fs::write(&path, serde_json::to_string_pretty(&base).unwrap()).unwrap();
+
+        let item = Item {
+            name: "obsidian".into(),
+            target: r"C:\o.exe".into(),
+            icon: None,
+        };
+        append_item_at(&path, item.clone(), &base).unwrap();
+        let cfg = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cfg.items.last() == Some(&item));
+        // icon: None stays out of the serialized form
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"icon\": null")
+        );
+
+        // Broken on-disk file: falls back to last_good instead of failing.
+        std::fs::write(&path, "{ not json").unwrap();
+        append_item_at(&path, item.clone(), &base).unwrap();
+        let cfg = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.items.len(), base.items.len() + 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

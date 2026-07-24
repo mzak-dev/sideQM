@@ -17,6 +17,7 @@ use crate::anim::{Animator, FrameModel};
 use crate::config::Config;
 use crate::geometry::MenuGeometry;
 use crate::icons;
+use crate::popover::{self, PopoverState};
 
 /// Icon inset and tile corner radius, as ratios of tile half-extent, so they
 /// keep their proportions under a configurable tile size instead of drifting.
@@ -36,9 +37,10 @@ struct ShapeInstance {
     border: f32,
     fill: [f32; 4],
     border_color: [f32; 4],
-    /// 0 = rounded box, 1 = arc stroke.
+    /// 0 = rounded box, 1 = arc stroke, 2 = circle segment (Gear zone).
     kind: f32,
     /// Arc: pointing angle, radians, same atan2 convention as `slot_angle`.
+    /// Segment: chord y-offset from the shape center, px (+down).
     angle_center: f32,
     /// Arc: half angular width, radians.
     angle_half: f32,
@@ -74,6 +76,37 @@ pub struct Tick {
     pub just_closed: bool,
 }
 
+/// Everything main knows that the renderer needs this frame.
+pub struct MenuView<'a> {
+    pub hover: Option<usize>,
+    pub gear_hover: bool,
+    pub popover: Option<&'a PopoverState>,
+}
+
+/// Popover text buffers, alive only from begin_pin until the next begin_open.
+struct PopBufs {
+    name: TextBuffer,
+    target: TextBuffer,
+    lbl_name: TextBuffer,
+    lbl_target: TextBuffer,
+    browse: TextBuffer,
+    icon_btn: TextBuffer,
+    commit: TextBuffer,
+    cancel: TextBuffer,
+    /// Icon-preview fallback letter when there's no extractable icon.
+    fallback: TextBuffer,
+    /// PopoverState.generation last shaped into name/target.
+    generation: u64,
+}
+
+/// Popover font sizes, px.
+const POP_FIELD_PX: f32 = 14.0;
+const POP_LABEL_PX: f32 = 11.0;
+const POP_BTN_PX: f32 = 13.0;
+const POP_FALLBACK_PX: f32 = 26.0;
+/// Horizontal text padding inside a field.
+const POP_FIELD_PAD: f32 = 9.0;
+
 pub struct Gfx {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -97,6 +130,12 @@ pub struct Gfx {
     hub_label_buf: TextBuffer,
     /// Hub's subtitle, shown only while a slot is selected.
     hub_sub_buf: TextBuffer,
+    /// Gear zone glyph (⚙) in the Hub's bottom segment.
+    gear_buf: TextBuffer,
+    /// Popover text, created lazily at begin_pin.
+    pop: Option<PopBufs>,
+    /// Popover icon-preview texture, when the current target yields one.
+    pop_icon: Option<wgpu::BindGroup>,
 
     slots: Vec<Slot>,
     /// The full config, one shape everywhere; visual values read straight off it.
@@ -107,6 +146,22 @@ pub struct Gfx {
     /// Hover whose Item name is currently shaped into the hub text buffers.
     shaped_hover: Option<usize>,
     last_tick: Instant,
+    /// Fixed origin for wall-clock effects (caret blink).
+    epoch: Instant,
+}
+
+/// Caret x-offset in a shaped single-line buffer, from glyph byte ranges.
+fn caret_x(buf: &TextBuffer, caret: usize) -> f32 {
+    let mut end_x = 0.0;
+    for run in buf.layout_runs() {
+        for g in run.glyphs {
+            if g.start >= caret {
+                return g.x;
+            }
+            end_x = g.x + g.w;
+        }
+    }
+    end_x
 }
 
 impl Gfx {
@@ -325,7 +380,13 @@ impl Gfx {
         let swash = SwashCache::new();
         let glyph_cache = GlyphCache::new(&device);
         let mut viewport = Viewport::new(&device, &glyph_cache);
-        viewport.update(&queue, Resolution { width: size.width, height: size.height });
+        viewport.update(
+            &queue,
+            Resolution {
+                width: size.width,
+                height: size.height,
+            },
+        );
         let mut atlas = TextAtlas::new(&device, &queue, &glyph_cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
@@ -334,6 +395,7 @@ impl Gfx {
         // "." text — that value isn't known this early in construction.
         let hub_label_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 16.9));
         let hub_sub_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
+        let gear_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
 
         let mut gfx = Gfx {
             surface,
@@ -354,12 +416,16 @@ impl Gfx {
             text_renderer,
             hub_label_buf,
             hub_sub_buf,
+            gear_buf,
+            pop: None,
+            pop_icon: None,
             slots: Vec::new(),
             cfg: cfg.clone(),
             geo,
             animator: Animator::new(),
             shaped_hover: None,
             last_tick: Instant::now(),
+            epoch: Instant::now(),
         };
         gfx.set_items(cfg, geo);
         gfx
@@ -384,11 +450,24 @@ impl Gfx {
             Shaping::Advanced,
             None,
         );
-        self.hub_label_buf.shape_until_scroll(&mut self.font_system, false);
+        self.hub_label_buf
+            .shape_until_scroll(&mut self.font_system, false);
         self.hub_sub_buf = TextBuffer::new(
             &mut self.font_system,
             Metrics::new(label_font_px * 0.85, label_font_px * 0.85 * 1.3),
         );
+        // Gear zone glyph, sized to the Hub's bottom segment (0.4 * hub_r tall).
+        // Named family: U+2699 must come from Segoe UI Symbol, not an emoji font.
+        let gear_px = geo.hub_r() * 0.28;
+        self.gear_buf = TextBuffer::new(&mut self.font_system, Metrics::new(gear_px, gear_px));
+        self.gear_buf.set_text(
+            "\u{2699}",
+            &Attrs::new().family(Family::Name("Segoe UI Symbol")),
+            Shaping::Advanced,
+            None,
+        );
+        self.gear_buf
+            .shape_until_scroll(&mut self.font_system, false);
 
         let total = geo.slot_count();
         self.animator.set_slot_count(total);
@@ -400,7 +479,12 @@ impl Gfx {
             .iter()
             .enumerate()
             .map(|(k, it)| (k, it.name.clone(), icons::icon_for(it), false))
-            .chain(std::iter::once((cfg.items.len(), "Dodaj".to_string(), None, true)))
+            .chain(std::iter::once((
+                cfg.items.len(),
+                "Dodaj".to_string(),
+                None,
+                true,
+            )))
         {
             let angle = geo.slot_angle(k);
             let bind = icon.map(|ic| self.upload_icon(&ic));
@@ -408,11 +492,20 @@ impl Gfx {
                 let ch = if is_meta {
                     "+".to_string()
                 } else {
-                    name.chars().next().unwrap_or('?').to_uppercase().to_string()
+                    name.chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_uppercase()
+                        .to_string()
                 };
                 let mut buf =
                     TextBuffer::new(&mut self.font_system, Metrics::new(glyph_px, glyph_px));
-                buf.set_text(&ch, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+                buf.set_text(
+                    &ch,
+                    &Attrs::new().family(Family::Monospace),
+                    Shaping::Advanced,
+                    None,
+                );
                 buf.shape_until_scroll(&mut self.font_system, false);
                 Some(buf)
             } else {
@@ -422,9 +515,21 @@ impl Gfx {
                 &mut self.font_system,
                 Metrics::new(label_font_px, label_font_px * 1.3),
             );
-            label_buf.set_text(&name, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+            label_buf.set_text(
+                &name,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
             label_buf.shape_until_scroll(&mut self.font_system, false);
-            slots.push(Slot { angle, label: name, icon: bind, letter, label_buf, is_meta });
+            slots.push(Slot {
+                angle,
+                label: name,
+                icon: bind,
+                letter,
+                label_buf,
+                is_meta,
+            });
         }
         self.slots = slots;
     }
@@ -442,15 +547,83 @@ impl Gfx {
         self.animator.begin_close(launched);
     }
 
+    /// Pinned started: build the Popover's text buffers and start its spring.
+    pub fn begin_pin(&mut self) {
+        let fs = &mut self.font_system;
+        let attrs = Attrs::new().family(Family::Monospace);
+        let mk = |fs: &mut FontSystem, px: f32, text: &str| {
+            let mut b = TextBuffer::new(fs, Metrics::new(px, px * 1.3));
+            b.set_text(text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(fs, false);
+            b
+        };
+        self.pop = Some(PopBufs {
+            name: mk(fs, POP_FIELD_PX, ""),
+            target: mk(fs, POP_FIELD_PX, ""),
+            lbl_name: mk(fs, POP_LABEL_PX, "nazwa"),
+            lbl_target: mk(fs, POP_LABEL_PX, "cel"),
+            browse: mk(fs, POP_BTN_PX, "\u{2026}"),
+            icon_btn: mk(fs, POP_BTN_PX, "ikona\u{2026}"),
+            commit: mk(fs, POP_BTN_PX, "dodaj"),
+            cancel: mk(fs, POP_BTN_PX, "anuluj"),
+            fallback: mk(fs, POP_FALLBACK_PX, "?"),
+            generation: u64::MAX, // force the first reshape
+        });
+        self.pop_icon = None;
+        self.animator.begin_pin();
+    }
+
+    /// Pinned ended: collapse the Popover spring (buffers die at next begin_open).
+    pub fn end_pin(&mut self) {
+        self.animator.end_pin();
+    }
+
+    /// Icon preview for the Popover's current target: a texture when one can
+    /// be extracted/loaded, else a fallback letter.
+    pub fn set_popover_icon(&mut self, icon: Option<&icons::RgbaIcon>, fallback: char) {
+        self.pop_icon = icon.map(|i| self.upload_icon(i));
+        if let Some(pop) = &mut self.pop {
+            let ch: String = fallback.to_uppercase().collect();
+            pop.fallback.set_text(
+                &ch,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            pop.fallback
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
     /// Advance the animation and draw one frame.
-    pub fn tick_render(&mut self, hover: Option<usize>) -> Tick {
+    pub fn tick_render(&mut self, view: &MenuView) -> Tick {
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
 
-        let frame = self.animator.tick(dt, hover, &self.geo, &self.cfg.animation);
+        let frame = self
+            .animator
+            .tick(dt, view.hover, &self.geo, &self.cfg.animation);
         if !frame.request_frame {
-            return Tick { request_frame: false, just_closed: frame.just_closed };
+            return Tick {
+                request_frame: false,
+                just_closed: frame.just_closed,
+            };
+        }
+
+        // Popover field text follows the editing state; reshape only on change.
+        if let Some(ps) = view.popover
+            && let Some(pop) = &mut self.pop
+            && pop.generation != ps.generation
+        {
+            let attrs = Attrs::new().family(Family::Monospace);
+            pop.name
+                .set_text(&ps.name.text, &attrs, Shaping::Advanced, None);
+            pop.name.shape_until_scroll(&mut self.font_system, false);
+            pop.target
+                .set_text(&ps.target.text, &attrs, Shaping::Advanced, None);
+            pop.target.shape_until_scroll(&mut self.font_system, false);
+            pop.generation = ps.generation;
         }
 
         // Hub text follows Hover; shaping needs the FontSystem, so it stays here.
@@ -459,26 +632,34 @@ impl Gfx {
             match frame.hovered {
                 Some(k) => {
                     let name = self.slots[k].label.to_lowercase();
-                    self.hub_label_buf.set_text(&name, &attrs, Shaping::Advanced, None);
-                    self.hub_label_buf.shape_until_scroll(&mut self.font_system, false);
+                    self.hub_label_buf
+                        .set_text(&name, &attrs, Shaping::Advanced, None);
+                    self.hub_label_buf
+                        .shape_until_scroll(&mut self.font_system, false);
                     self.hub_sub_buf.set_text(
                         "puść, aby uruchomić",
                         &attrs,
                         Shaping::Advanced,
                         None,
                     );
-                    self.hub_sub_buf.shape_until_scroll(&mut self.font_system, false);
+                    self.hub_sub_buf
+                        .shape_until_scroll(&mut self.font_system, false);
                 }
                 None => {
-                    self.hub_label_buf.set_text("\u{b7}", &attrs, Shaping::Advanced, None);
-                    self.hub_label_buf.shape_until_scroll(&mut self.font_system, false);
+                    self.hub_label_buf
+                        .set_text("\u{b7}", &attrs, Shaping::Advanced, None);
+                    self.hub_label_buf
+                        .shape_until_scroll(&mut self.font_system, false);
                 }
             }
             self.shaped_hover = frame.hovered;
         }
 
-        self.draw(&frame);
-        Tick { request_frame: true, just_closed: false }
+        self.draw(&frame, view);
+        Tick {
+            request_frame: true,
+            just_closed: false,
+        }
     }
 
     fn upload_icon(&self, icon: &icons::RgbaIcon) -> wgpu::BindGroup {
@@ -532,14 +713,19 @@ impl Gfx {
             0,
             bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
         );
-        self.viewport.update(&self.queue, Resolution { width, height });
+        self.viewport
+            .update(&self.queue, Resolution { width, height });
     }
 
     /// sRGB component -> linear, when the surface format demands linear input.
     fn col(&self, c: [f32; 3], a: f32) -> [f32; 4] {
         if self.srgb {
             let f = |v: f32| {
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
             };
             [f(c[0]), f(c[1]), f(c[2]), a]
         } else {
@@ -547,9 +733,17 @@ impl Gfx {
         }
     }
 
-    fn draw(&mut self, frame: &FrameModel) {
+    fn draw(&mut self, frame: &FrameModel, view: &MenuView) {
         let center = self.surface_cfg.width as f32 / 2.0;
         let hover = frame.hovered;
+        // Popover expand progress; the meta Tile morphs into the panel, so it
+        // stops drawing as itself the moment the popover exists.
+        let pop_p = if view.popover.is_some() {
+            frame.popover
+        } else {
+            0.0
+        };
+        let pop_active = view.popover.is_some() && frame.popover > 0.001;
         let accent = self.cfg.appearance.accent_rgb();
         let opacity = self.cfg.appearance.opacity();
         // Hex sources: scrim #18191F, hub #101216, idle caption #7D8590, hub idle dot #5C6570.
@@ -583,7 +777,10 @@ impl Gfx {
             .iter()
             .zip(&frame.slots)
             .map(|(slot, sf)| {
-                let pos = [center + slot.angle.cos() * rest_r, center + slot.angle.sin() * rest_r];
+                let pos = [
+                    center + slot.angle.cos() * rest_r,
+                    center + slot.angle.sin() * rest_r,
+                ];
                 (pos, sf.scale, sf.alpha)
             })
             .collect();
@@ -614,8 +811,20 @@ impl Gfx {
                 ..Default::default()
             },
         ];
+        // Gear zone: the Hub's bottom segment; release there opens config.json.
+        shapes.push(ShapeInstance {
+            pos: [center, center],
+            half: [hub_r, hub_r],
+            fill: self.col(
+                if view.gear_hover { accent } else { white },
+                (if view.gear_hover { 0.14 } else { 0.05 }) * scrim_alpha,
+            ),
+            kind: 2.0,
+            angle_center: self.geo.gear_cut_dy(),
+            ..Default::default()
+        });
         for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
-            if scale < 0.01 || alpha < 0.01 {
+            if scale < 0.01 || alpha < 0.01 || (self.slots[k].is_meta && pop_active) {
                 continue;
             }
             let hovered = hover == Some(k);
@@ -648,26 +857,150 @@ impl Gfx {
             });
         }
 
-        let shape_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("shapes"),
-            contents: bytemuck::cast_slice(&shapes),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // --- Popover: panel morphing out of the Dodaj Tile + form widgets ---
+        // Content fades in over the last stretch of the expansion.
+        let pop_content_a = ((pop_p - 0.6) / 0.4).clamp(0.0, 1.0) * scrim_alpha;
+        let to_win = |r: &popover::Rect| [center + r.center[0], center + r.center[1]];
+        if pop_active {
+            let ps = view.popover.unwrap();
+            let lp = |a: f32, b: f32| a + (b - a) * pop_p;
+            let panel = ps.layout.panel;
+            shapes.push(ShapeInstance {
+                pos: [
+                    center + lp(ps.origin[0], panel.center[0]),
+                    center + lp(ps.origin[1], panel.center[1]),
+                ],
+                half: [lp(tile_half, panel.half[0]), lp(tile_half, panel.half[1])],
+                corner: lp(tile_corner, 12.0),
+                border: 1.1,
+                fill: self.col(hub_bg, 0.97 * scrim_alpha),
+                border_color: self.col(white, 0.10 * scrim_alpha),
+                ..Default::default()
+            });
+            if pop_content_a > 0.01 {
+                let field = |r: &popover::Rect, focused: bool| ShapeInstance {
+                    pos: to_win(r),
+                    half: r.half,
+                    corner: 8.0,
+                    border: 1.1,
+                    fill: self.col(white, 0.05 * pop_content_a),
+                    border_color: self.col(
+                        if focused { accent } else { white },
+                        (if focused { 0.85 } else { 0.12 }) * pop_content_a,
+                    ),
+                    ..Default::default()
+                };
+                use popover::Element as El;
+                shapes.push(field(&ps.layout.name_field, ps.focus == El::NameField));
+                shapes.push(field(&ps.layout.target_field, ps.focus == El::TargetField));
+                let button = |r: &popover::Rect, hovered: bool| ShapeInstance {
+                    pos: to_win(r),
+                    half: r.half,
+                    corner: 8.0,
+                    border: 1.1,
+                    fill: self.col(white, (if hovered { 0.11 } else { 0.06 }) * pop_content_a),
+                    border_color: self.col(
+                        if hovered { accent } else { white },
+                        (if hovered { 0.55 } else { 0.12 }) * pop_content_a,
+                    ),
+                    ..Default::default()
+                };
+                shapes.push(button(&ps.layout.browse_btn, ps.hover == Some(El::Browse)));
+                shapes.push(button(&ps.layout.icon_btn, ps.hover == Some(El::IconBtn)));
+                shapes.push(button(&ps.layout.cancel_btn, ps.hover == Some(El::Cancel)));
+                // Commit: accent when valid, muted when the target is empty.
+                let valid = ps.valid();
+                shapes.push(ShapeInstance {
+                    pos: to_win(&ps.layout.commit_btn),
+                    half: ps.layout.commit_btn.half,
+                    corner: 8.0,
+                    border: 1.1,
+                    fill: self.col(
+                        if valid { accent } else { white },
+                        (if valid { 0.9 } else { 0.05 }) * pop_content_a,
+                    ),
+                    border_color: self.col(
+                        accent,
+                        (if valid {
+                            1.0
+                        } else if ps.hover == Some(El::Commit) {
+                            0.35
+                        } else {
+                            0.0
+                        }) * pop_content_a,
+                    ),
+                    ..Default::default()
+                });
+                // Icon preview well.
+                shapes.push(ShapeInstance {
+                    pos: to_win(&ps.layout.icon_preview),
+                    half: ps.layout.icon_preview.half,
+                    corner: 8.0,
+                    border: 1.1,
+                    fill: self.col(white, 0.05 * pop_content_a),
+                    border_color: self.col(white, 0.10 * pop_content_a),
+                    ..Default::default()
+                });
+                // Caret in the focused field, 1s blink cycle.
+                let blink_on = self.epoch.elapsed().as_millis() % 1000 < 500;
+                if blink_on && let Some(pop) = &self.pop {
+                    let (rect, buf, caret) = if ps.focus == El::TargetField {
+                        (&ps.layout.target_field, &pop.target, ps.target.caret)
+                    } else {
+                        (&ps.layout.name_field, &pop.name, ps.name.caret)
+                    };
+                    let cx = caret_x(buf, caret);
+                    let inner_w = rect.half[0] * 2.0 - 2.0 * POP_FIELD_PAD;
+                    let scroll = (inner_w - 2.0 - cx).min(0.0);
+                    let x = center + rect.left() + POP_FIELD_PAD + scroll + cx;
+                    shapes.push(ShapeInstance {
+                        pos: [x, center + rect.center[1]],
+                        half: [0.75, rect.half[1] - 7.0],
+                        fill: self.col(accent, 0.95 * pop_content_a),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let shape_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("shapes"),
+                contents: bytemuck::cast_slice(&shapes),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
 
         // --- icon quads ---
-        let tex_instances: Vec<TexInstance> = tiles
+        let mut tex_instances: Vec<TexInstance> = tiles
             .iter()
             .map(|&(pos, scale, alpha)| TexInstance {
                 pos,
-                half: [(tile_half - icon_inset) * scale, (tile_half - icon_inset) * scale],
+                half: [
+                    (tile_half - icon_inset) * scale,
+                    (tile_half - icon_inset) * scale,
+                ],
                 alpha,
             })
             .collect();
-        let tex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tex-instances"),
-            contents: bytemuck::cast_slice(&tex_instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // Popover icon preview rides at the end, drawn with its own bind group.
+        let pop_icon_instance = (pop_active && pop_content_a > 0.01 && self.pop_icon.is_some())
+            .then(|| {
+                let r = &view.popover.unwrap().layout.icon_preview;
+                tex_instances.push(TexInstance {
+                    pos: to_win(r),
+                    half: [r.half[0] - 6.0, r.half[1] - 6.0],
+                    alpha: pop_content_a,
+                });
+                tex_instances.len() - 1
+            });
+        let tex_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tex-instances"),
+                contents: bytemuck::cast_slice(&tex_instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
 
         // --- text areas: fallback letters, always-on tile labels, hub text ---
         let mut areas: Vec<TextArea> = Vec::new();
@@ -679,7 +1012,7 @@ impl Gfx {
         };
         for (k, slot) in self.slots.iter().enumerate() {
             let (pos, scale, alpha) = tiles[k];
-            if scale < 0.01 || alpha < 0.01 {
+            if scale < 0.01 || alpha < 0.01 || (slot.is_meta && pop_active) {
                 continue;
             }
             if let Some(letter) = &slot.letter {
@@ -697,7 +1030,11 @@ impl Gfx {
                 });
             }
             let hovered = hover == Some(k);
-            let label_w = slot.label_buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+            let label_w = slot
+                .label_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
             areas.push(TextArea {
                 buffer: &slot.label_buf,
                 left: pos[0] - label_w / 2.0,
@@ -708,7 +1045,11 @@ impl Gfx {
                 custom_glyphs: &[],
             });
         }
-        let name_w = self.hub_label_buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+        let name_w = self
+            .hub_label_buf
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0f32, f32::max);
         areas.push(TextArea {
             buffer: &self.hub_label_buf,
             left: center - name_w / 2.0,
@@ -719,7 +1060,11 @@ impl Gfx {
             custom_glyphs: &[],
         });
         if hover.is_some() {
-            let sub_w = self.hub_sub_buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+            let sub_w = self
+                .hub_sub_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
             areas.push(TextArea {
                 buffer: &self.hub_sub_buf,
                 left: center - sub_w / 2.0,
@@ -729,6 +1074,121 @@ impl Gfx {
                 default_color: rgba(idle_text, scrim_alpha),
                 custom_glyphs: &[],
             });
+        }
+        // Gear glyph, centered in the Hub's bottom segment.
+        {
+            let gear_w = self
+                .gear_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            let gear_px = self.geo.hub_r() * 0.28;
+            let seg_cy = center + (self.geo.gear_cut_dy() + hub_r) / 2.0;
+            areas.push(TextArea {
+                buffer: &self.gear_buf,
+                left: center - gear_w / 2.0,
+                top: seg_cy - gear_px * 0.62,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: rgba(if view.gear_hover { accent } else { hub_dot }, scrim_alpha),
+                custom_glyphs: &[],
+            });
+        }
+        // Popover text: labels, field contents (clipped + caret-scrolled),
+        // button captions, and the icon-preview fallback letter.
+        if pop_active
+            && pop_content_a > 0.01
+            && let (Some(ps), Some(pop)) = (view.popover, &self.pop)
+        {
+            use popover::Element as El;
+            let a = pop_content_a;
+            let text_c = [0.92, 0.94, 0.96];
+            let width_of =
+                |buf: &TextBuffer| buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+            for (buf, rect) in [
+                (&pop.lbl_name, &ps.layout.name_field),
+                (&pop.lbl_target, &ps.layout.target_field),
+            ] {
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: center + rect.left() + 2.0,
+                    top: center + rect.top() - POP_LABEL_PX * 1.55,
+                    scale: 1.0,
+                    bounds: full_bounds,
+                    default_color: rgba(idle_text, a),
+                    custom_glyphs: &[],
+                });
+            }
+            for (buf, rect, caret, focused) in [
+                (
+                    &pop.name,
+                    &ps.layout.name_field,
+                    ps.name.caret,
+                    ps.focus == El::NameField,
+                ),
+                (
+                    &pop.target,
+                    &ps.layout.target_field,
+                    ps.target.caret,
+                    ps.focus == El::TargetField,
+                ),
+            ] {
+                let inner_w = rect.half[0] * 2.0 - 2.0 * POP_FIELD_PAD;
+                let scroll = if focused {
+                    (inner_w - 2.0 - caret_x(buf, caret)).min(0.0)
+                } else {
+                    0.0
+                };
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: center + rect.left() + POP_FIELD_PAD + scroll,
+                    top: center + rect.center[1] - POP_FIELD_PX * 0.62,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: (center + rect.left() + 3.0) as i32,
+                        top: (center + rect.top()) as i32,
+                        right: (center + rect.left() + rect.half[0] * 2.0 - 3.0) as i32,
+                        bottom: (center + rect.top() + rect.half[1] * 2.0) as i32,
+                    },
+                    default_color: rgba(text_c, a),
+                    custom_glyphs: &[],
+                });
+            }
+            let valid = ps.valid();
+            let buttons: [(&TextBuffer, &popover::Rect, [f32; 3]); 4] = [
+                (&pop.browse, &ps.layout.browse_btn, text_c),
+                (&pop.icon_btn, &ps.layout.icon_btn, text_c),
+                (&pop.cancel, &ps.layout.cancel_btn, idle_text),
+                // Dark caption on the accent-filled commit; muted when disabled.
+                (
+                    &pop.commit,
+                    &ps.layout.commit_btn,
+                    if valid { [0.06, 0.07, 0.09] } else { idle_text },
+                ),
+            ];
+            for (buf, rect, color) in buttons {
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: center + rect.center[0] - width_of(buf) / 2.0,
+                    top: center + rect.center[1] - POP_BTN_PX * 0.62,
+                    scale: 1.0,
+                    bounds: full_bounds,
+                    default_color: rgba(color, a),
+                    custom_glyphs: &[],
+                });
+            }
+            if self.pop_icon.is_none() {
+                let rect = &ps.layout.icon_preview;
+                areas.push(TextArea {
+                    buffer: &pop.fallback,
+                    left: center + rect.center[0] - width_of(&pop.fallback) / 2.0,
+                    top: center + rect.center[1] - POP_FALLBACK_PX * 0.55,
+                    scale: 1.0,
+                    bounds: full_bounds,
+                    default_color: rgba(idle_text, a),
+                    custom_glyphs: &[],
+                });
+            }
         }
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
@@ -761,10 +1221,14 @@ impl Gfx {
                 return;
             }
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("menu"),
@@ -795,8 +1259,15 @@ impl Gfx {
                     pass.draw(0..6, k as u32..k as u32 + 1);
                 }
             }
+            if let (Some(i), Some(bind)) = (pop_icon_instance, &self.pop_icon) {
+                pass.set_bind_group(1, bind, &[]);
+                pass.draw(0..6, i as u32..i as u32 + 1);
+            }
 
-            if let Err(e) = self.text_renderer.render(&self.atlas, &self.viewport, &mut pass) {
+            if let Err(e) = self
+                .text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+            {
                 eprintln!("sideQM: text render failed: {e}");
             }
         }

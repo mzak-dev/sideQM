@@ -573,9 +573,12 @@ impl Gfx {
         self.animator.begin_pin();
     }
 
-    /// Pinned ended: collapse the Popover spring (buffers die at next begin_open).
+    /// Pinned ended: collapse the Popover spring and free its text/icon
+    /// resources now, rather than holding them until the next begin_open.
     pub fn end_pin(&mut self) {
         self.animator.end_pin();
+        self.pop = None;
+        self.pop_icon = None;
     }
 
     /// Icon preview for the Popover's current target: a texture when one can

@@ -231,10 +231,10 @@ impl PopoverState {
 
     pub fn on_click(&mut self, el: Element) -> Option<Action> {
         match el {
+            // Focus/caret only — no text changed, so no reshape is needed.
             Element::NameField | Element::TargetField => {
                 self.focus = el;
                 self.focused_field().end_caret();
-                self.generation += 1;
                 None
             }
             Element::Browse => Some(Action::Browse),
@@ -245,7 +245,9 @@ impl PopoverState {
     }
 
     pub fn on_key(&mut self, key: Key) -> Option<Action> {
-        self.generation += 1;
+        // Only bump `generation` for edits that actually change field text —
+        // pure focus/caret moves (Tab, arrows, Home/End) reuse the already-
+        // shaped buffer, so a reshape in gfx would be wasted work.
         match key {
             Key::Escape => return Some(Action::Discard),
             Key::Enter => return self.valid().then_some(Action::Commit),
@@ -261,12 +263,14 @@ impl PopoverState {
                     self.name_touched = true;
                 }
                 self.focused_field().backspace();
+                self.generation += 1;
             }
             Key::Delete => {
                 if self.focus == Element::NameField {
                     self.name_touched = true;
                 }
                 self.focused_field().delete();
+                self.generation += 1;
             }
             Key::Left => self.focused_field().left(),
             Key::Right => self.focused_field().right(),

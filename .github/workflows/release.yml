@@ -7,6 +7,14 @@ on:
 permissions:
   contents: write
 
+# Serialize master runs: the "does this release exist yet" check and the create
+# that follows it are not atomic, so two merges landing close together could both
+# pass the check and the second would fail on create. cancel-in-progress stays
+# false - killing a run mid-publish is worse than waiting.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-latest
@@ -17,8 +25,9 @@ jobs:
       run: cargo test --release --verbose
     - name: Build release binary
       run: cargo build --release --verbose
-    # ponytail: version lives in Cargo.toml, so a merge that bumps it cuts a release
-    # and every other merge no-ops. No tagging step, no release-please.
+    # ponytail: version lives in Cargo.toml, so a merge that bumps it publishes a release.
+    # Every merge still tests and builds - it is only this step that no-ops when the
+    # version is unchanged. No tagging step, no release-please.
     # target/release is mostly build cache (deps/, .fingerprint/, *.pdb) - ship only the exe.
     - name: Publish release if Cargo.toml version is new
       env:

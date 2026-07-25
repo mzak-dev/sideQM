@@ -1,15 +1,12 @@
 //! The add-item Popover: layout, hit-testing, and single-line text editing.
 //! Pure logic — no GPU, no winit, no Win32 — so all of it is unit-testable.
-//! Coordinates are relative to the Menu center (which is the window center),
-//! in px, so they survive the window growing while Pinned.
+//! Coordinates are relative to the Menu center (which is the window center), px.
 
 use std::path::Path;
 
 /// Panel dimensions, px.
 pub const PANEL_W: f32 = 320.0;
 pub const PANEL_H: f32 = 224.0;
-/// Gap between the Scrim's edge and the panel.
-pub const GAP: f32 = 12.0;
 
 /// Center + half-extents rectangle, Menu-center-relative px.
 #[derive(Clone, Copy, Debug)]
@@ -311,19 +308,6 @@ impl Field {
     }
 }
 
-/// Place a panel's center on one axis so a panel of half-extent `half` stays
-/// within the work-area span `[lo, hi]`. When the span is narrower than the
-/// panel, center the panel instead — `f32::clamp` PANICS on an inverted range,
-/// which a tiny monitor or odd multi-monitor layout would otherwise trigger.
-pub fn clamp_panel_axis(desired: f32, half: f32, lo: f32, hi: f32) -> f32 {
-    let (min, max) = (lo + half, hi - half);
-    if min <= max {
-        desired.clamp(min, max)
-    } else {
-        (lo + hi) / 2.0
-    }
-}
-
 /// Name for an Item the user didn't name: URL host, else file stem, else the
 /// raw target. Always lowercased, like the rest of the Menu's text.
 pub fn fallback_name(target: &str) -> String {
@@ -557,15 +541,5 @@ mod tests {
         assert!(!overlaps(l.commit_btn, l.cancel_btn));
         assert!(!overlaps(l.target_field, l.browse_btn));
         assert!(!overlaps(l.icon_preview, l.icon_btn));
-    }
-
-    #[test]
-    fn clamp_panel_axis_centers_when_the_area_is_too_small() {
-        // Roomy span: normal clamp keeps the panel off the edges.
-        assert_eq!(clamp_panel_axis(1000.0, 50.0, 0.0, 400.0), 350.0);
-        assert_eq!(clamp_panel_axis(-1000.0, 50.0, 0.0, 400.0), 50.0);
-        assert_eq!(clamp_panel_axis(200.0, 50.0, 0.0, 400.0), 200.0);
-        // Span narrower than the panel: center it (no inverted-range panic).
-        assert_eq!(clamp_panel_axis(9999.0, 200.0, 0.0, 100.0), 50.0);
     }
 }

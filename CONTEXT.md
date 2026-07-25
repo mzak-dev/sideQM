@@ -53,6 +53,18 @@ _Avoid_: focus, highlight
 The per-Slot delay applied during the open and close animations.
 _Avoid_: cascade, sequence delay
 
+**Pinned**:
+The Menu state entered by releasing the Trigger over the "Dodaj" Slot: the Menu stays up without the Trigger held, the window takes keyboard focus, and the Popover is open. Clicking away, Escape, commit, or a fresh Trigger press leaves it.
+_Avoid_: sticky mode, edit mode
+
+**Popover**:
+The inline add-item form (name, target, browse, icon picker, commit/cancel) that expands out of the "Dodaj" Tile while Pinned.
+_Avoid_: popup, dialog, modal, panel
+
+**Gear zone**:
+The Hub's bottom segment; releasing the Trigger there opens config.json in the default editor — the secondary, manual editing path.
+_Avoid_: settings button
+
 ## Relationships
 
 - A **Slot** shows exactly one **Item**, except the meta "Dodaj" slot

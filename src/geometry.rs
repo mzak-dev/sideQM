@@ -5,6 +5,7 @@
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 use crate::config::Appearance;
+use crate::popover;
 
 /// Snapshot of the Menu's shape for a given config + Item count. Cheap `Copy`;
 /// App builds it (startup + config reload) and Gfx keeps a copy — both come
@@ -112,9 +113,12 @@ impl MenuGeometry {
 
     /// Square window edge length — headroom has to grow with tile/label size
     /// or a large configured tile/label clips at the window edge.
+    /// ADR-0002: the window never resizes at runtime, so it must fit the
+    /// Popover panel from the start, even under a tiny configured radius.
     pub fn window_size(&self) -> u32 {
         let margin = self.tile_half + self.label_font_px * 3.0 + 20.0;
-        2 * (self.scrim_r + margin) as u32
+        let panel_floor = (popover::PANEL_W.max(popover::PANEL_H) + 24.0) as u32;
+        (2 * (self.scrim_r + margin) as u32).max(panel_floor)
     }
 }
 
@@ -216,6 +220,23 @@ mod tests {
         assert!(!g.in_gear_zone((1000.0, 500.0), c)); // at center
         assert!(!g.in_gear_zone((1000.0, 470.0), c)); // above center
         assert_eq!(g.hovered_slot((1000.0, 530.0), c), None); // still dead to launches
+    }
+
+    #[test]
+    fn window_always_fits_the_popover_panel() {
+        // Minimal clamped config (radius 80, tiles 16, labels 8) would yield a
+        // 280px window — smaller than the 320px panel. The floor must win.
+        let g = MenuGeometry {
+            scrim_r: 80.0,
+            tile_half: 16.0,
+            hub_ratio: 0.2,
+            label_font_px: 8.0,
+            slot_count: 2,
+        };
+        let panel = popover::PANEL_W.max(popover::PANEL_H) as u32;
+        assert!(g.window_size() > panel);
+        // A roomy config is untouched by the floor.
+        assert_eq!(geo(5).window_size(), 2 * (200 + 32 + 39 + 20));
     }
 
     fn angle_point(deg: f32, r: f32) -> (f64, f64) {

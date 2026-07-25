@@ -166,40 +166,6 @@ impl App {
         self.gear_hover = false;
         hook::MENU_OPEN.store(false, Ordering::Relaxed);
 
-        // Panel placement: radially outward from the Dodaj Tile, kept on-screen.
-        let a = self.geo.slot_angle(self.geo.meta_slot());
-        let (dx, dy) = (a.cos(), a.sin());
-        let support = dx.abs() * popover::PANEL_W / 2.0 + dy.abs() * popover::PANEL_H / 2.0;
-        let dist = self.geo.scrim_r() + popover::GAP + support;
-        let work = work_area_at(self.center.0 as i32, self.center.1 as i32);
-        let (pw2, ph2) = (popover::PANEL_W / 2.0, popover::PANEL_H / 2.0);
-        let sx = popover::clamp_panel_axis(
-            self.center.0 as f32 + dx * dist,
-            pw2,
-            work.left as f32 + 8.0,
-            work.right as f32 - 8.0,
-        );
-        let sy = popover::clamp_panel_axis(
-            self.center.1 as f32 + dy * dist,
-            ph2,
-            work.top as f32 + 8.0,
-            work.bottom as f32 - 8.0,
-        );
-        let rel = [sx - self.center.0 as f32, sy - self.center.1 as f32];
-
-        // Grow the window symmetrically so the panel fits; symmetric growth
-        // keeps the drawn Menu center on the same screen pixel.
-        let cur = window.inner_size().width;
-        let reach = (rel[0].abs() + pw2).max(rel[1].abs() + ph2) + 8.0;
-        let need = ((reach * 2.0).ceil() as u32 + 1) & !1;
-        if need > cur {
-            if let Ok(pos) = window.outer_position() {
-                let delta = ((need - cur) / 2) as i32;
-                window.set_outer_position(PhysicalPosition::new(pos.x - delta, pos.y - delta));
-            }
-            let _ = window.request_inner_size(PhysicalSize::new(need, need));
-        }
-
         set_no_activate(&window, false);
         if let Some(hwnd) = hwnd_of(&window) {
             unsafe {
@@ -209,9 +175,13 @@ impl App {
         window.focus_window();
         window.set_ime_allowed(true);
 
-        let origin = [dx * self.geo.rest_r(), dy * self.geo.rest_r()];
+        // ADR-0002: the window never resizes while the swapchain lives (the AMD
+        // driver resets on ResizeBuffers of a DComp swapchain), so the panel
+        // draws centered over the Menu, inside the existing window bounds.
+        let a = self.geo.slot_angle(self.geo.meta_slot());
+        let origin = [a.cos() * self.geo.rest_r(), a.sin() * self.geo.rest_r()];
         self.pinned = Some(popover::PopoverState::new(
-            popover::Layout::new(rel),
+            popover::Layout::new([0.0, 0.0]),
             origin,
         ));
         if let Some(g) = &mut self.gfx {
@@ -518,11 +488,6 @@ impl ApplicationHandler<AppEvent> for App {
                     let tick = g.tick_render(&view);
                     if tick.just_closed {
                         w.set_visible(false);
-                        // Shed any Pinned-time growth while nobody's looking.
-                        let size = self.geo.window_size();
-                        if w.inner_size().width != size {
-                            let _ = w.request_inner_size(PhysicalSize::new(size, size));
-                        }
                     } else if tick.request_frame {
                         w.request_redraw();
                     }

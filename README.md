@@ -1,4 +1,6 @@
 # sideQM
+## Disclaimer:
+## It is fully Prompt Engineered (in simple words Vibe Coded) using Claude Code i always wanted app like that and i wanted to experiment with rust and ai, don't treat it like it is fully stable/ready
 
 A translucent radial launcher for Windows. Hold a mouse side button anywhere
 on the desktop, sweep toward an app, release to launch it.

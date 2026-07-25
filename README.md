@@ -7,6 +7,8 @@ on the desktop, sweep toward an app, release to launch it.
 
 [![Rust CI](https://github.com/mzak-dev/sideQM/actions/workflows/rust.yml/badge.svg)](https://github.com/mzak-dev/sideQM/actions/workflows/rust.yml)
 
+<img width="480" height="480" alt="output" src="https://github.com/user-attachments/assets/e3e8517c-4b69-473b-865c-2f959c902567" />
+
 ## How it works
 
 Holding the **Trigger** (a mouse side button) summons the **Menu**: a

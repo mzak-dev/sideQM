@@ -23,7 +23,11 @@ points at it. Release over a tile to launch it; release over the center
   exes, URLs, folders, or documents — anything the shell can open
 - Spring-animated open/close with per-tile stagger, tuned entirely via config
 - **Dodaj** slot adds a new item inline — name, target (with a file browse
-  dialog), optional icon — no manual JSON editing required
+  dialog), optional icon — no manual JSON editing required. You can also drag
+  a file onto the open form: an image becomes the icon, anything else becomes
+  the target
+- Icons in PNG, JPEG, WebP, ICO, BMP, GIF, or SVG; a chosen icon is copied into
+  `%APPDATA%\sideQM\icons\`, so it survives the original being moved or deleted
 - Gear zone on the Hub opens `config.json` directly for advanced tweaks
 - Lives in the system tray; optional autostart with Windows
 - `config.json` is auto-repopulated with any options added since it was last
@@ -80,7 +84,7 @@ defaults on first run:
 | `animation.bounciness`   | `0` = no overshoot, `1` = jelly                            |
 | `animation.hover_scale`  | Scale applied to the Hovered tile                          |
 | `items[].target`         | Executable, URL, folder, or document to launch             |
-| `items[].icon`           | Optional PNG path; otherwise the target's own shell icon is used (not available for URLs) |
+| `items[].icon`           | Optional image path (PNG, JPEG, WebP, ICO, BMP, GIF, SVG); otherwise the target's own shell icon is used (not available for URLs). Backslashes must be doubled in JSON: `"C:\\Tools\\icon.png"` |
 
 ## Development
 
@@ -102,3 +106,9 @@ version bump in `Cargo.toml` — no tagging by hand.
 Debug env vars: `SIDEQM_CONFIG_PATH` (point at a scratch config file),
 `SIDEQM_BACKEND` (`vulkan`/`gl` override), `SIDEQM_AUTOSHOW` (open the Menu
 without holding the Trigger).
+
+If an icon doesn't show up or a config edit seems ignored, check
+`%APPDATA%\sideQM\sideqm.log` — it records every icon that failed to load and
+every config parse error, with the path and the reason. The release build has no
+console, so this file is the only place those show up. It is rewritten on each
+start.

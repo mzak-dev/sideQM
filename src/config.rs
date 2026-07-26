@@ -244,10 +244,10 @@ pub fn parse_and_resync(path: &std::path::Path, raw: &str) -> serde_json::Result
         return Ok((cfg, raw.to_string()));
     }
     if let Err(e) = std::fs::write(path, &canonical) {
-        eprintln!("sideQM: could not resync config with current options: {e}");
+        crate::log!("could not resync config with current options: {e}");
         return Ok((cfg, raw.to_string()));
     }
-    eprintln!("sideQM: config.json updated with current options (existing values kept)");
+    crate::log!("config.json updated with current options (existing values kept)");
     Ok((cfg, canonical))
 }
 
@@ -264,7 +264,10 @@ pub fn load() -> (Config, String) {
         Ok(raw) => match parse_and_resync(&path, &raw) {
             Ok((cfg, raw)) => (cfg, raw),
             Err(e) => {
-                eprintln!("sideQM: config parse error ({e}); using defaults until fixed");
+                crate::log!(
+                    "config parse error ({e}); using defaults until fixed. \
+                     In JSON a Windows path needs doubled backslashes, e.g. \"C:\\\\Tools\\\\app.exe\""
+                );
                 (Config::default(), raw)
             }
         },
@@ -300,7 +303,7 @@ fn write_default(path: &std::path::Path) -> (Config, String) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Err(e) = std::fs::write(path, &raw) {
-        eprintln!("sideQM: could not write default config: {e}");
+        crate::log!("could not write default config: {e}");
     }
     (cfg, raw)
 }

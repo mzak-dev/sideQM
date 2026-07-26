@@ -308,6 +308,27 @@ impl Field {
     }
 }
 
+/// What a file dropped on the Popover is meant to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropKind {
+    Image,
+    Target,
+}
+
+/// An image becomes the Item's icon; anything else becomes what it launches.
+/// Extension-based on purpose — a drop should resolve instantly, and reading
+/// the file to sniff it would stall the frame for a network path.
+pub fn classify_drop(path: &str) -> DropKind {
+    let ext = Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "ico" | "bmp" | "gif" | "svg" => DropKind::Image,
+        _ => DropKind::Target,
+    }
+}
+
 /// Name for an Item the user didn't name: URL host, else file stem, else the
 /// raw target. Always lowercased, like the rest of the Menu's text.
 pub fn fallback_name(target: &str) -> String {
@@ -347,6 +368,19 @@ mod tests {
         f.caret = 0;
         f.delete();
         assert_eq!(f.text, "ł");
+    }
+
+    #[test]
+    fn drops_are_classified_by_extension() {
+        assert_eq!(classify_drop(r"C:\a\logo.png"), DropKind::Image);
+        assert_eq!(classify_drop(r"C:\a\logo.PNG"), DropKind::Image);
+        assert_eq!(classify_drop(r"C:\a\logo.svg"), DropKind::Image);
+        assert_eq!(classify_drop(r"C:\a\logo.WebP"), DropKind::Image);
+        assert_eq!(classify_drop(r"C:\a\app.exe"), DropKind::Target);
+        assert_eq!(classify_drop(r"C:\a\app.lnk"), DropKind::Target);
+        assert_eq!(classify_drop(r"C:\a\noext"), DropKind::Target);
+        // A directory named like an image must not turn the exe into an icon.
+        assert_eq!(classify_drop(r"C:\dir.png\app.exe"), DropKind::Target);
     }
 
     #[test]

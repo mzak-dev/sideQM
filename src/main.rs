@@ -6,10 +6,13 @@ mod dialog;
 mod geometry;
 mod gfx;
 mod hook;
+mod icon_service;
 mod icons;
 mod launch;
+mod logging;
 mod popover;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -27,7 +30,7 @@ use windows::core::w;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -37,13 +40,22 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::Config;
+use crate::dialog::PickPurpose;
 use crate::geometry::MenuGeometry;
 use crate::hook::HookEvent;
+use crate::icon_service::{IconKey, IconReady, IconService, JobClass};
 
 #[derive(Debug)]
 pub enum AppEvent {
     Hook(HookEvent),
     Menu(MenuEvent),
+    /// The icon worker finished a decode.
+    Icon(IconReady),
+    /// The file picker thread closed, with or without a pick.
+    FilePicked {
+        purpose: PickPurpose,
+        path: Option<PathBuf>,
+    },
 }
 
 struct App {
@@ -54,6 +66,12 @@ struct App {
     window: Option<Arc<Window>>,
     gfx: Option<gfx::Gfx>,
     tray: Option<TrayIcon>,
+    proxy: EventLoopProxy<AppEvent>,
+    icons: IconService,
+    /// One key per Item, parallel to cfg.items. An arriving icon is matched
+    /// against these rather than against the request that asked for it, so a
+    /// config reload mid-decode drops the stale result instead of misplacing it.
+    slot_keys: Vec<IconKey>,
     /// Window center in global screen px, valid while shown.
     center: (f64, f64),
     hover: Option<usize>,
@@ -62,13 +80,15 @@ struct App {
     gear_hover: bool,
     /// Pinned state: the add-item Popover is open; Some while it lives.
     pinned: Option<popover::PopoverState>,
-    /// A modal file dialog is up: suppress the focus-loss discard.
+    /// A file dialog is up: suppress the focus-loss discard until it reports back.
     in_dialog: bool,
     /// Cursor position relative to the Menu center (window px), while Pinned.
     cursor_rel: (f32, f32),
     modifiers: ModifiersState,
-    /// (target, icon_override) last probed for the Popover's icon preview.
-    icon_probe: Option<(String, Option<String>)>,
+    /// What the Popover's icon preview is currently showing.
+    popover_key: Option<IconKey>,
+    /// The letter standing in for that preview; `begin_pin` shapes it as '?'.
+    popover_fallback: char,
 }
 
 /// 32x32 mint filled circle, the tray icon.
@@ -115,8 +135,72 @@ impl App {
                 if let Some(g) = &mut self.gfx {
                     g.set_items(&self.cfg, self.geo);
                 }
+                self.request_item_icons();
             }
-            Err(e) => eprintln!("sideQM: config parse error ({e}); keeping previous config"),
+            Err(e) => log!(
+                "config parse error ({e}); keeping previous config. \
+                 In JSON a Windows path needs doubled backslashes, e.g. \"C:\\\\Tools\\\\app.exe\""
+            ),
+        }
+    }
+
+    /// Ask for every Tile's icon. Cached ones are applied on the spot; the rest
+    /// arrive as `AppEvent::Icon` and the Tile shows its letter until they do.
+    fn request_item_icons(&mut self) {
+        self.slot_keys = self.cfg.items.iter().map(IconService::key_for_item).collect();
+        for k in 0..self.slot_keys.len() {
+            let key = self.slot_keys[k].clone();
+            if let Some(Some(icon)) = self.icons.request(key, JobClass::Menu)
+                && let Some(g) = &mut self.gfx
+            {
+                g.set_slot_icon(k, &icon);
+            }
+        }
+    }
+
+    fn on_icon_ready(&mut self, ready: IconReady) {
+        self.icons.complete(&ready);
+        let Some(icon) = &ready.icon else {
+            return; // failed: the fallback letter already stands in for it
+        };
+        if let Some(g) = &mut self.gfx {
+            for k in 0..self.slot_keys.len() {
+                if self.slot_keys[k] == ready.key {
+                    g.set_slot_icon(k, icon);
+                }
+            }
+            if self.popover_key.as_ref() == Some(&ready.key)
+                && let Some(ps) = &self.pinned
+            {
+                let fallback = ps.final_name().chars().next().unwrap_or('?');
+                g.set_popover_icon(Some(icon), fallback);
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn on_file_picked(&mut self, purpose: PickPurpose, path: Option<PathBuf>) {
+        self.in_dialog = false;
+        if let Some(w) = &self.window {
+            w.focus_window();
+        }
+        if let Some(path) = path {
+            let path = path.to_string_lossy().to_string();
+            if let Some(ps) = &mut self.pinned {
+                match purpose {
+                    PickPurpose::Icon => {
+                        ps.icon_override = Some(path);
+                        ps.generation += 1;
+                    }
+                    PickPurpose::Target => ps.apply_picked_file(&path),
+                }
+            }
+            self.refresh_popover_icon();
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -187,7 +271,8 @@ impl App {
         if let Some(g) = &mut self.gfx {
             g.begin_pin();
         }
-        self.icon_probe = None;
+        self.popover_key = None;
+        self.popover_fallback = '?'; // what begin_pin just shaped
         self.refresh_popover_icon();
         window.request_redraw();
     }
@@ -212,42 +297,46 @@ impl App {
             popover::Action::Discard => self.unpin(true),
             popover::Action::Commit => {
                 if let Some(ps) = &self.pinned {
+                    // Copy the picked image into the Icon Library now, so the
+                    // Item keeps its icon when the original is moved or deleted.
+                    let icon = ps.icon_override.as_ref().map(|p| {
+                        match icons::import_to_library(std::path::Path::new(p)) {
+                            Ok(stored) => stored.to_string_lossy().to_string(),
+                            Err(e) => {
+                                log!("could not copy icon {p} into the library: {e}");
+                                p.clone()
+                            }
+                        }
+                    });
                     let item = config::Item {
                         name: ps.final_name(),
                         target: ps.target.text.trim().to_string(),
-                        icon: ps.icon_override.clone(),
+                        icon,
                     };
                     if let Err(e) = config::append_item(item, &self.cfg) {
-                        eprintln!("sideQM: could not save the new item: {e}");
+                        log!("could not save the new item: {e}");
                     }
                 }
                 self.unpin(true);
             }
             popover::Action::Browse | popover::Action::BrowseIcon => {
-                let images = action == popover::Action::BrowseIcon;
+                if self.in_dialog {
+                    return;
+                }
                 let Some(hwnd) = self.window.as_deref().and_then(hwnd_of) else {
                     return;
                 };
-                // Blocking modal dialog; in_dialog suppresses the Focused(false)
-                // discard that the dialog taking focus would otherwise fire.
+                let purpose = if action == popover::Action::BrowseIcon {
+                    PickPurpose::Icon
+                } else {
+                    PickPurpose::Target
+                };
+                // The picker runs on its own thread and reports back as
+                // AppEvent::FilePicked; the event loop keeps running behind it,
+                // which is what keeps in_dialog covering the dialog's real
+                // lifetime. See ADR-0004.
                 self.in_dialog = true;
-                let picked = dialog::pick_file(hwnd, images);
-                self.in_dialog = false;
-                if let Some(w) = &self.window {
-                    w.focus_window();
-                }
-                if let Some(path) = picked {
-                    let path = path.to_string_lossy().to_string();
-                    if let Some(ps) = &mut self.pinned {
-                        if images {
-                            ps.icon_override = Some(path);
-                            ps.generation += 1;
-                        } else {
-                            ps.apply_picked_file(&path);
-                        }
-                    }
-                    self.refresh_popover_icon();
-                }
+                dialog::pick_file_async(hwnd.0 as isize, purpose, self.proxy.clone());
             }
         }
     }
@@ -293,27 +382,29 @@ impl App {
         }
     }
 
-    /// Re-extract the Popover's icon preview when its inputs changed.
+    /// Point the Popover's icon preview at whatever the fields describe now.
+    /// A cached icon appears immediately; anything else shows the fallback
+    /// letter until the worker reports back.
     fn refresh_popover_icon(&mut self) {
         let Some(ps) = &self.pinned else { return };
-        let key = (ps.target.text.trim().to_string(), ps.icon_override.clone());
-        if self.icon_probe.as_ref() == Some(&key) {
-            return;
-        }
-        let icon = if key.0.is_empty() && key.1.is_none() {
-            None
-        } else {
-            icons::icon_for(&config::Item {
-                name: String::new(),
-                target: key.0.clone(),
-                icon: key.1.clone(),
-            })
-        };
+        let key = IconService::key_for_popover(&ps.target.text, ps.icon_override.as_deref());
         let fallback = ps.final_name().chars().next().unwrap_or('?');
-        if let Some(g) = &mut self.gfx {
-            g.set_popover_icon(icon.as_ref(), fallback);
+        if key != self.popover_key {
+            self.popover_key = key.clone();
+            self.popover_fallback = fallback;
+            let icon = key
+                .and_then(|k| self.icons.request(k, JobClass::Preview))
+                .flatten();
+            if let Some(g) = &mut self.gfx {
+                g.set_popover_icon(icon.as_deref(), fallback);
+            }
+        } else if fallback != self.popover_fallback {
+            // Typing a name changes the letter but not the icon.
+            self.popover_fallback = fallback;
+            if let Some(g) = &mut self.gfx {
+                g.set_popover_fallback(fallback);
+            }
         }
-        self.icon_probe = Some(key);
     }
 }
 
@@ -335,7 +426,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.tray = Some(tray);
                 launch::promote_tray_icon();
             }
-            Err(e) => eprintln!("sideQM: tray icon failed: {e}"),
+            Err(e) => log!("tray icon failed: {e}"),
         }
         let size = self.geo.window_size();
         let attrs = Window::default_attributes()
@@ -354,6 +445,7 @@ impl ApplicationHandler<AppEvent> for App {
         set_no_activate(&window, true);
         self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg, self.geo));
         self.window = Some(window);
+        self.request_item_icons();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -367,10 +459,22 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 return;
             }
+            AppEvent::Icon(ready) => {
+                self.on_icon_ready(ready);
+                return;
+            }
+            AppEvent::FilePicked { purpose, path } => {
+                self.on_file_picked(purpose, path);
+                return;
+            }
         };
         match event {
             HookEvent::TriggerDown { x, y } => {
-                println!("trigger down at ({x}, {y})");
+                // A file picker owns the Popover right now; re-summoning the
+                // Menu would strand the pick that is still coming back.
+                if self.in_dialog {
+                    return;
+                }
                 // Pressing the Trigger while Pinned discards the Popover and
                 // starts a fresh press-and-hold Menu at the cursor.
                 if self.pinned.is_some() {
@@ -478,6 +582,24 @@ impl ApplicationHandler<AppEvent> for App {
                     self.refresh_popover_icon();
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                // Only while Pinned: the press-and-hold Menu holds the mouse
+                // button down, so there is no hand free to drag anything onto it.
+                if let Some(ps) = &mut self.pinned {
+                    let path = path.to_string_lossy().to_string();
+                    match popover::classify_drop(&path) {
+                        popover::DropKind::Image => {
+                            ps.icon_override = Some(path);
+                            ps.generation += 1;
+                        }
+                        popover::DropKind::Target => ps.apply_picked_file(&path),
+                    }
+                    self.refresh_popover_icon();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let (Some(g), Some(w)) = (&mut self.gfx, &self.window) {
                     let view = gfx::MenuView {
@@ -539,8 +661,12 @@ fn main() {
         return;
     }
 
-    // COM apartment for the Popover's IFileOpenDialog; S_FALSE (already
-    // initialized) is fine, so the result is deliberately ignored.
+    logging::init();
+
+    // COM apartment for shell calls on this thread; S_FALSE (already
+    // initialized) is fine, so the result is deliberately ignored. winit's own
+    // OleInitialize (which is what makes file drops work) is happy to join an
+    // existing STA.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
@@ -559,6 +685,7 @@ fn main() {
     }));
 
     let geo = MenuGeometry::new(&cfg.appearance, cfg.items.len());
+    let proxy = event_loop.create_proxy();
     let mut app = App {
         cfg,
         geo,
@@ -566,6 +693,9 @@ fn main() {
         window: None,
         gfx: None,
         tray: None,
+        icons: IconService::new(proxy.clone()),
+        proxy,
+        slot_keys: Vec::new(),
         center: (0.0, 0.0),
         hover: None,
         held: false,
@@ -574,7 +704,8 @@ fn main() {
         in_dialog: false,
         cursor_rel: (0.0, 0.0),
         modifiers: ModifiersState::default(),
-        icon_probe: None,
+        popover_key: None,
+        popover_fallback: '?',
     };
     event_loop.run_app(&mut app).expect("event loop run");
 }

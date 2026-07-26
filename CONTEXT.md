@@ -25,6 +25,14 @@ _Avoid_: sector, position
 The visual square representing a Slot (icon or fallback letter), plus its always-visible caption underneath.
 _Avoid_: button, icon box
 
+**Icon**:
+The image on a Tile. It has two possible sources, in precedence order: the Item's own icon file, else the one extracted from whatever the Item launches. A Tile whose Icon is missing, still loading, or unreadable shows its fallback letter instead — the Menu never waits for one and never breaks over one.
+_Avoid_: image, thumbnail, glyph, bitmap
+
+**Icon Library**:
+The folder of icon files the app owns, alongside config.json. Choosing an Icon in the Popover copies the file in and points the Item at the copy, so moving or deleting the original leaves the Item intact. It holds the only copy of nothing else, but it is a library, not a cache: regenerating it is impossible, and deleting it loses Icons.
+_Avoid_: icon cache, cached_icons, thumbnail store
+
 **Scrim**:
 The Menu's neutral backdrop circle (a faint fill, a barely-there border) that everything else sits on top of.
 _Avoid_: ring, border, circle edge
@@ -68,6 +76,7 @@ _Avoid_: settings button
 ## Relationships
 
 - A **Slot** shows exactly one **Item**, except the meta "Dodaj" slot
+- A **Tile** shows its **Item**'s **Icon** when there is one, and its fallback letter otherwise — including while the Icon is still being read
 - **Hover** selects at most one **Slot**; release over it launches its **Item**
 - The **Arc** and **Hub** both track **Hover**; neither decides what launches, they only preview it
 - Losing **Hover** (cursor back in the **Dead zone**) simply fades the **Arc** out and the **Hub** back to its idle dot — no separate "cancelled" state exists

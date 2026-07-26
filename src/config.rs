@@ -26,6 +26,51 @@ pub struct Animation {
     pub hover_scale: f32,
 }
 
+/// Same doctrine as `Appearance`: every knob here is user-editable JSON, so
+/// every accessor clamps to a range that can't break rendering. The durations
+/// matter most — they set spring stiffness, and a 1 ms response is stiff enough
+/// to diverge the integrator into infinities that reach the GPU.
+impl Animation {
+    /// 0 keeps its meaning (skip the entrance entirely, handled without any
+    /// spring); any real duration gets a floor that stays integrable.
+    pub fn open_ms(&self) -> u32 {
+        if self.open_ms == 0 {
+            0
+        } else {
+            self.open_ms.clamp(60, 5_000)
+        }
+    }
+
+    pub fn close_ms(&self) -> u32 {
+        if self.close_ms == 0 {
+            0
+        } else {
+            self.close_ms.clamp(60, 5_000)
+        }
+    }
+
+    pub fn stagger_ms(&self) -> u32 {
+        self.stagger_ms.min(1_000)
+    }
+
+    /// NaN would survive a bare `clamp` and poison every spring it damps.
+    pub fn bounciness(&self) -> f32 {
+        if self.bounciness.is_finite() {
+            self.bounciness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn hover_scale(&self) -> f32 {
+        if self.hover_scale.is_finite() {
+            self.hover_scale.clamp(0.5, 3.0)
+        } else {
+            1.16
+        }
+    }
+}
+
 impl Default for Animation {
     fn default() -> Self {
         Self {
@@ -94,9 +139,12 @@ impl Appearance {
         self.opacity.clamp(0.0, 1.0)
     }
 
-    /// Ring radius in px, clamped so the menu can't collapse to nothing.
+    /// Ring radius in px. The floor keeps the Menu from collapsing to nothing;
+    /// the ceiling matters more than it looks — this sets the window's edge
+    /// length, and the window's size is the swapchain's size. An unbounded
+    /// value asks the driver for a surface no GPU will allocate.
     pub fn radius_px(&self) -> u32 {
-        self.radius_px.max(80)
+        self.radius_px.clamp(80, 2_000)
     }
 
     /// Tile half-extent in px — the unit the renderer actually wants.
@@ -347,5 +395,49 @@ mod tests {
         assert!(a.tile_half() >= 16.0);
         assert!(a.hub_ratio() <= 0.6);
         assert!(a.label_font_px() >= 8.0);
+
+        // The radius sets the window size, which is the swapchain size: an
+        // unbounded value asks the driver for a surface it cannot allocate.
+        let huge = Appearance {
+            radius_px: u32::MAX,
+            ..Appearance::default()
+        };
+        assert!(huge.radius_px() <= 2_000);
+    }
+
+    /// Animation values feed spring stiffness directly. Left unclamped, a short
+    /// duration diverges the integrator and the renderer draws infinities.
+    #[test]
+    fn animation_accessors_clamp_bad_values() {
+        let a = Animation {
+            open_ms: 1,
+            close_ms: 2,
+            stagger_ms: u32::MAX,
+            bounciness: 9.0,
+            hover_scale: 1e30,
+        };
+        assert!(a.open_ms() >= 60);
+        assert!(a.close_ms() >= 60);
+        assert!(a.stagger_ms() <= 1_000);
+        assert!((0.0..=1.0).contains(&a.bounciness()));
+        assert!(a.hover_scale() <= 3.0);
+
+        // 0 keeps its meaning: skip the animation entirely.
+        let instant = Animation {
+            open_ms: 0,
+            close_ms: 0,
+            ..Animation::default()
+        };
+        assert_eq!(instant.open_ms(), 0);
+        assert_eq!(instant.close_ms(), 0);
+
+        // NaN survives a bare clamp; these must not hand it to a spring.
+        let nan = Animation {
+            bounciness: f32::NAN,
+            hover_scale: f32::NAN,
+            ..Animation::default()
+        };
+        assert!(nan.bounciness().is_finite());
+        assert!(nan.hover_scale().is_finite());
     }
 }

@@ -32,11 +32,25 @@ struct Spring {
     v: f32,
 }
 
+/// Integration steps are kept under this much spring travel (omega * step).
+/// Symplectic Euler diverges once omega * step approaches 2, and a diverged
+/// spring is not a cosmetic problem: `scale` reaches the renderer as infinite
+/// quad extents, every Tile covers the screen, and the resulting overdraw can
+/// take the display driver down with it.
+const MAX_SPRING_STEP: f32 = 0.2;
+
 impl Spring {
     fn tick(&mut self, target: f32, omega: f32, zeta: f32, dt: f32) {
-        let accel = -2.0 * zeta * omega * self.v - omega * omega * (self.x - target);
-        self.v += accel * dt;
-        self.x += self.v * dt;
+        // A stiff spring (short response) or a long frame needs more than one
+        // step to stay inside the stable region. Config clamping keeps omega
+        // bounded, so the step ceiling is never actually reached.
+        let steps = ((omega * dt / MAX_SPRING_STEP).ceil() as i32).clamp(1, 64);
+        let h = dt / steps as f32;
+        for _ in 0..steps {
+            let accel = -2.0 * zeta * omega * self.v - omega * omega * (self.x - target);
+            self.v += accel * h;
+            self.x += self.v * h;
+        }
     }
 
     fn settled(&self, target: f32) -> bool {
@@ -192,10 +206,13 @@ impl Animator {
         cfg: &Animation,
     ) -> FrameModel {
         let n = self.tile_springs.len().max(1);
-        let zeta_open = (1.0 - 0.6 * cfg.bounciness.clamp(0.0, 1.0)).max(0.15);
-        let omega_open = 4.0 / (zeta_open * (cfg.open_ms.max(1) as f32 / 1000.0));
-        let omega_close = 4.0 / (cfg.close_ms.max(1) as f32 / 1000.0);
-        let stagger = cfg.stagger_ms as f32 / 1000.0;
+        // Accessors, not fields: these come from user-edited JSON and a stiff
+        // enough spring diverges (see MAX_SPRING_STEP).
+        let (open_ms, close_ms) = (cfg.open_ms(), cfg.close_ms());
+        let zeta_open = (1.0 - 0.6 * cfg.bounciness()).max(0.15);
+        let omega_open = 4.0 / (zeta_open * (open_ms.max(1) as f32 / 1000.0));
+        let omega_close = 4.0 / (close_ms.max(1) as f32 / 1000.0);
+        let stagger = cfg.stagger_ms() as f32 / 1000.0;
 
         if let Phase::Shown { elapsed } = &mut self.phase {
             *elapsed += dt;
@@ -204,14 +221,14 @@ impl Animator {
             Phase::Closed => return FrameModel::idle(hover, false),
             Phase::Shown { elapsed } => {
                 for (k, s) in self.tile_springs.iter_mut().enumerate() {
-                    if cfg.open_ms == 0 {
+                    if open_ms == 0 {
                         *s = Spring { x: 1.0, v: 0.0 };
                     } else if elapsed >= k as f32 * stagger {
                         s.tick(1.0, omega_open, zeta_open, dt);
                     }
                 }
                 // The Scrim starts once ~60% of the tiles have begun landing.
-                if cfg.open_ms == 0 {
+                if open_ms == 0 {
                     self.scrim_spring = Spring { x: 1.0, v: 0.0 };
                 } else if elapsed >= SCRIM_GATE * n as f32 * stagger {
                     self.scrim_spring.tick(1.0, omega_open, zeta_open, dt);
@@ -220,14 +237,14 @@ impl Animator {
             Phase::Closing => {
                 let mut all_settled = true;
                 for s in &mut self.tile_springs {
-                    if cfg.close_ms == 0 {
+                    if close_ms == 0 {
                         *s = Spring::default();
                     } else {
                         s.tick(0.0, omega_close, 1.0, dt);
                     }
                     all_settled &= s.settled(0.0);
                 }
-                if cfg.close_ms == 0 {
+                if close_ms == 0 {
                     self.scrim_spring = Spring::default();
                 } else {
                     self.scrim_spring.tick(0.0, omega_close, 1.0, dt);
@@ -244,13 +261,13 @@ impl Animator {
         // toward hover_scale than away from it, plus a bigger "launched" pop ---
         let omega_select = 4.0 / (zeta_open * SELECT_RESPONSE_S);
         let omega_deselect = 4.0 / DESELECT_RESPONSE_S;
-        let pop_scale = cfg.hover_scale * POP_RATIO;
+        let pop_scale = cfg.hover_scale() * POP_RATIO;
         for (k, s) in self.select_springs.iter_mut().enumerate() {
             let target = if matches!(self.phase, Phase::Closing) && self.closing_launched == Some(k)
             {
                 pop_scale
             } else if hover == Some(k) {
-                cfg.hover_scale
+                cfg.hover_scale()
             } else {
                 1.0
             };
@@ -446,6 +463,45 @@ mod tests {
         a.end_pin();
         let frame = run(&mut a, &g, &c, None, 1.5);
         assert!(frame.popover < 0.05);
+    }
+
+    /// Hostile config values must never reach the renderer as inf/NaN: a tile
+    /// scale of infinity draws every Tile over the whole screen, and that much
+    /// overdraw in the SDF shader can reset the display driver.
+    #[test]
+    fn absurd_animation_config_still_produces_finite_frames() {
+        let g = geo(11);
+        let hostile = [
+            // A 1 ms response is stiff enough to diverge single-step Euler.
+            Animation { open_ms: 1, close_ms: 1, stagger_ms: 0, bounciness: 0.0, hover_scale: 1.16 },
+            Animation { open_ms: 1, close_ms: 1, stagger_ms: 0, bounciness: 1.0, hover_scale: 1.16 },
+            Animation { open_ms: 2, close_ms: 3, stagger_ms: u32::MAX, bounciness: 5.0, hover_scale: 1e30 },
+            Animation {
+                open_ms: 1,
+                close_ms: 1,
+                stagger_ms: 1,
+                bounciness: f32::NAN,
+                hover_scale: f32::NAN,
+            },
+        ];
+        for c in hostile {
+            let mut a = opened(12);
+            // Long frames too: dt is capped at 0.05 by the render loop.
+            for _ in 0..400 {
+                let f = a.tick(0.05, Some(3), &g, &c);
+                assert!(f.scrim.is_finite(), "scrim diverged");
+                assert!(f.popover.is_finite(), "popover diverged");
+                if let Some((angle, alpha)) = f.arc {
+                    assert!(angle.is_finite() && alpha.is_finite(), "arc diverged");
+                }
+                for (k, s) in f.slots.iter().enumerate() {
+                    assert!(s.scale.is_finite(), "slot {k} scale diverged");
+                    assert!(s.alpha.is_finite(), "slot {k} alpha diverged");
+                    // Also bounded: a huge-but-finite scale is just as fatal.
+                    assert!(s.scale.abs() < 100.0, "slot {k} scale ran away: {}", s.scale);
+                }
+            }
+        }
     }
 
     #[test]

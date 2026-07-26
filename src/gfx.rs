@@ -431,7 +431,9 @@ impl Gfx {
         gfx
     }
 
-    /// Rebuild slot layout, icon textures, and fallback letters from config.
+    /// Rebuild slot layout and fallback letters from config. Icons are not
+    /// touched here — decoding happens off-thread and arrives later through
+    /// `set_slot_icon`, so a Tile shows its letter until then.
     pub fn set_items(&mut self, cfg: &Config, geo: MenuGeometry) {
         self.cfg = cfg.clone();
         self.geo = geo;
@@ -474,21 +476,19 @@ impl Gfx {
 
         let glyph_px = geo.glyph_px();
         let mut slots = Vec::with_capacity(total);
-        for (k, name, icon, is_meta) in cfg
+        for (k, name, is_meta) in cfg
             .items
             .iter()
             .enumerate()
-            .map(|(k, it)| (k, it.name.clone(), icons::icon_for(it), false))
+            .map(|(k, it)| (k, it.name.clone(), false))
             .chain(std::iter::once((
                 cfg.items.len(),
                 "Dodaj".to_string(),
-                None,
                 true,
             )))
         {
             let angle = geo.slot_angle(k);
-            let bind = icon.map(|ic| self.upload_icon(&ic));
-            let letter = if bind.is_none() {
+            let letter = {
                 let ch = if is_meta {
                     "+".to_string()
                 } else {
@@ -508,8 +508,6 @@ impl Gfx {
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
                 Some(buf)
-            } else {
-                None
             };
             let mut label_buf = TextBuffer::new(
                 &mut self.font_system,
@@ -525,13 +523,22 @@ impl Gfx {
             slots.push(Slot {
                 angle,
                 label: name,
-                icon: bind,
+                icon: None,
                 letter,
                 label_buf,
                 is_meta,
             });
         }
         self.slots = slots;
+    }
+
+    /// A decode finished: upload it and let the Tile stop drawing its letter.
+    /// Called from the event loop, which owns the Device and Queue.
+    pub fn set_slot_icon(&mut self, k: usize, icon: &icons::RgbaIcon) {
+        let bind = self.upload_icon(icon);
+        if let Some(slot) = self.slots.get_mut(k) {
+            slot.icon = Some(bind);
+        }
     }
 
     /// Start (or restart) the entrance. Reopening mid-close keeps the current
@@ -581,10 +588,16 @@ impl Gfx {
         self.pop_icon = None;
     }
 
-    /// Icon preview for the Popover's current target: a texture when one can
-    /// be extracted/loaded, else a fallback letter.
+    /// Icon preview for the Popover's current target: a texture when one has
+    /// been decoded, else a fallback letter.
     pub fn set_popover_icon(&mut self, icon: Option<&icons::RgbaIcon>, fallback: char) {
         self.pop_icon = icon.map(|i| self.upload_icon(i));
+        self.set_popover_fallback(fallback);
+    }
+
+    /// Just the letter — the name field changed but the icon didn't, so there
+    /// is no reason to re-upload the texture.
+    pub fn set_popover_fallback(&mut self, fallback: char) {
         if let Some(pop) = &mut self.pop {
             let ch: String = fallback.to_uppercase().collect();
             pop.fallback.set_text(
@@ -1018,7 +1031,11 @@ impl Gfx {
             if scale < 0.01 || alpha < 0.01 || (slot.is_meta && pop_active) {
                 continue;
             }
-            if let Some(letter) = &slot.letter {
+            // The letter is what a Tile shows until its icon has been decoded,
+            // and what it keeps forever if there is no icon to be had.
+            if slot.icon.is_none()
+                && let Some(letter) = &slot.letter
+            {
                 // Positioning ratios tuned against geo.glyph_px(), the same
                 // size set_items shaped this buffer with.
                 let glyph_px = self.geo.glyph_px();

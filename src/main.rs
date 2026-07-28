@@ -124,22 +124,13 @@ struct Drag {
 /// How far the cursor must travel before a press becomes a drag, px.
 const DRAG_THRESHOLD: f32 = 5.0;
 
-/// 32x32 mint filled circle, the tray icon.
+/// The tray icon, baked in at compile time (icon concept 2a).
 fn tray_icon_rgba() -> tray_icon::Icon {
-    const N: i32 = 32;
-    let mut px = Vec::with_capacity((N * N * 4) as usize);
-    for y in 0..N {
-        for x in 0..N {
-            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
-            let inside = (dx * dx + dy * dy).sqrt() <= 14.0;
-            px.extend_from_slice(if inside {
-                &[0x5D, 0xCA, 0xA5, 0xff]
-            } else {
-                &[0, 0, 0, 0]
-            });
-        }
-    }
-    tray_icon::Icon::from_rgba(px, N as u32, N as u32).expect("tray icon")
+    let img = image::load_from_memory(include_bytes!("../assets/icon/tray-32.png"))
+        .expect("decode tray icon")
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("tray icon")
 }
 
 impl App {

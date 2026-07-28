@@ -1,10 +1,8 @@
-use std::os::windows::process::CommandExt;
-use std::process::Command;
-
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+    RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -17,35 +15,51 @@ pub fn open(target: &str) {
     }
 }
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// ponytail: reg.exe instead of registry API code — one process call, same result.
+/// Registry API in-process, not `reg.exe`: a hidden child process patching the
+/// Run key is a persistence pattern AV heuristics (Defender flagged this as
+/// Trojan:Win32/Bearfoos.A!ml on another machine) key off, even though it's
+/// legitimate here.
 pub fn set_autostart(enable: bool) {
-    let status = if enable {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        Command::new("reg")
-            .args(["add", RUN_KEY, "/v", "sideQM", "/t", "REG_SZ", "/d"])
-            .arg(&exe)
-            .args(["/f"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-    } else {
-        // Deleting a key that doesn't exist fails; that's fine, ignore it quietly.
-        Command::new("reg")
-            .args(["delete", RUN_KEY, "/v", "sideQM", "/f"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-    };
-    if enable {
-        if let Err(e) = status {
-            eprintln!("sideQM: autostart registration failed: {e}");
+    unsafe {
+        let mut key = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(RUN_KEY),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+        .is_err()
+        {
+            return;
         }
+        if enable {
+            let Ok(exe) = std::env::current_exe() else {
+                let _ = RegCloseKey(key);
+                return;
+            };
+            let mut value: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
+            value.push(0);
+            let byte_len = (value.len() * 2) as u32;
+            let _ = RegSetKeyValueW(
+                key,
+                None,
+                w!("sideQM"),
+                REG_SZ.0,
+                Some(value.as_ptr().cast()),
+                byte_len,
+            );
+        } else {
+            // Deleting a value that doesn't exist fails; that's fine, ignore it quietly.
+            let _ = RegDeleteKeyValueW(key, None, w!("sideQM"));
+        }
+        let _ = RegCloseKey(key);
     }
 }
 

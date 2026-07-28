@@ -8,7 +8,35 @@ pub struct Config {
     pub autostart: bool,
     pub appearance: Appearance,
     pub animation: Animation,
+    pub add_slot: AddSlot,
     pub items: Vec<Item>,
+}
+
+/// The meta "Dodaj" slot's two independent properties. `hidden` is what the
+/// Hub's toggle flips; `position` is left alone by it, so hiding the slot and
+/// showing it again puts it back where it was.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct AddSlot {
+    pub position: AddPosition,
+    pub hidden: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AddPosition {
+    First,
+    #[default]
+    Last,
+}
+
+impl Default for AddSlot {
+    fn default() -> Self {
+        Self {
+            position: AddPosition::Last,
+            hidden: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -177,6 +205,7 @@ impl Default for Config {
             autostart: false,
             appearance: Appearance::default(),
             animation: Animation::default(),
+            add_slot: AddSlot::default(),
             items: vec![
                 Item {
                     name: "Terminal".into(),
@@ -275,25 +304,24 @@ pub fn load() -> (Config, String) {
     }
 }
 
-/// Append one Item to config.json (the Popover's commit). Fresh-reads the
-/// file so concurrent hand-edits survive; if the on-disk file doesn't parse,
-/// falls back to the caller's last-good config rather than losing the add.
-/// Canonical pretty format — the next load's resync is a no-op.
-pub fn append_item(item: Item, last_good: &Config) -> std::io::Result<()> {
-    append_item_at(&config_path(), item, last_good)
+/// Write `cfg` to config.json and return the text written, for the caller to
+/// keep as its `cfg_raw` so the next load's resync is a no-op.
+///
+/// ADR-0006: every Item mutation goes through here, writing the config the app
+/// holds rather than re-reading the file first. Removing and reordering are
+/// index-based, and an index only means something against the list the user is
+/// looking at. This is also the one place a future undo would hook into.
+pub fn save(cfg: &Config) -> std::io::Result<String> {
+    save_at(&config_path(), cfg)
 }
 
-fn append_item_at(path: &std::path::Path, item: Item, last_good: &Config) -> std::io::Result<()> {
-    let mut cfg = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| parse(&raw).ok())
-        .unwrap_or_else(|| last_good.clone());
-    cfg.items.push(item);
-    let raw = serde_json::to_string_pretty(&cfg).unwrap();
+fn save_at(path: &std::path::Path, cfg: &Config) -> std::io::Result<String> {
+    let raw = serde_json::to_string_pretty(cfg).unwrap();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(path, raw)
+    std::fs::write(path, &raw)?;
+    Ok(raw)
 }
 
 fn write_default(path: &std::path::Path) -> (Config, String) {
@@ -352,35 +380,57 @@ mod tests {
     }
 
     #[test]
-    fn append_item_round_trips_and_survives_a_broken_file() {
-        let dir = std::env::temp_dir().join(format!("sideqm-test-append-{}", std::process::id()));
+    fn save_round_trips_and_returns_the_canonical_text() {
+        let dir = std::env::temp_dir().join(format!("sideqm-test-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        let base = Config::default();
-        std::fs::write(&path, serde_json::to_string_pretty(&base).unwrap()).unwrap();
 
-        let item = Item {
+        let mut cfg = Config::default();
+        cfg.items.push(Item {
             name: "obsidian".into(),
             target: r"C:\o.exe".into(),
             icon: None,
-        };
-        append_item_at(&path, item.clone(), &base).unwrap();
-        let cfg = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(cfg.items.last() == Some(&item));
-        // icon: None stays out of the serialized form
-        assert!(
-            !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"icon\": null")
-        );
+        });
+        let raw = save_at(&path, &cfg).unwrap();
 
-        // Broken on-disk file: falls back to last_good instead of failing.
+        // The returned text is exactly what landed on disk — the caller keeps
+        // it as cfg_raw, so the next load's resync has nothing to do.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        let back = parse(&raw).unwrap();
+        assert!(back == cfg);
+        let (_, resynced) = parse_and_resync(&path, &raw).unwrap();
+        assert_eq!(resynced, raw);
+        // icon: None stays out of the serialized form
+        assert!(!raw.contains("\"icon\": null"));
+
+        // ADR-0006: an unparseable file on disk is overwritten, not merged —
+        // what the app holds is the truth.
         std::fs::write(&path, "{ not json").unwrap();
-        append_item_at(&path, item.clone(), &base).unwrap();
-        let cfg = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(cfg.items.len(), base.items.len() + 1);
+        save_at(&path, &cfg).unwrap();
+        assert!(parse(&std::fs::read_to_string(&path).unwrap()).unwrap() == cfg);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hiding the Dodaj slot must not disturb where it sits, so the toggle can
+    /// put it back. Both live under one key but stay independent.
+    #[test]
+    fn add_slot_position_survives_hiding() {
+        let cfg = parse(r#"{"add_slot":{"position":"first","hidden":true}}"#).unwrap();
+        assert_eq!(cfg.add_slot.position, AddPosition::First);
+        assert!(cfg.add_slot.hidden);
+
+        // Flipping `hidden` (what the Hub's toggle does) leaves `position` alone.
+        let mut cfg = cfg;
+        cfg.add_slot.hidden = false;
+        assert_eq!(cfg.add_slot.position, AddPosition::First);
+
+        // Defaults: shown, last.
+        let d = Config::default().add_slot;
+        assert_eq!(d.position, AddPosition::Last);
+        assert!(!d.hidden);
+        // A file that predates the option backfills to the default.
+        assert!(parse("{}").unwrap().add_slot == d);
     }
 
     #[test]

@@ -188,6 +188,8 @@ pub struct PopoverState {
     pub hover: Option<Element>,
     /// Bumped on every edit; gfx reshapes its text buffers when it changes.
     pub generation: u64,
+    /// The Item index being edited, or None when this form adds a new one.
+    pub editing: Option<usize>,
 }
 
 impl PopoverState {
@@ -202,7 +204,22 @@ impl PopoverState {
             icon_override: None,
             hover: None,
             generation: 0,
+            editing: None,
         }
+    }
+
+    /// Fill the form from an existing Item, for editing it.
+    ///
+    /// `name_touched` is set because the name shown is a real one the user
+    /// chose: browsing for a different target must not silently rewrite it,
+    /// which is exactly what it would do to an untouched empty field.
+    pub fn load(&mut self, name: &str, target: &str, icon: Option<&str>) {
+        self.name.set(name);
+        self.target.set(target);
+        self.name_touched = !name.is_empty();
+        self.icon_override = icon.map(str::to_string);
+        self.focus = Element::NameField;
+        self.generation += 1;
     }
 
     pub fn valid(&self) -> bool {

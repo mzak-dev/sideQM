@@ -31,7 +31,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{ModifiersState, NamedKey};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
@@ -78,8 +78,8 @@ struct App {
     held: bool,
     /// The Gear zone (Hub's bottom segment) is under the cursor.
     gear_hover: bool,
-    /// Pinned state: the add-item Popover is open; Some while it lives.
-    pinned: Option<popover::PopoverState>,
+    /// Some while Pinned. A Popover inside it is optional — see ADR-0005.
+    pinned: Option<Pinned>,
     /// A file dialog is up: suppress the focus-loss discard until it reports back.
     in_dialog: bool,
     /// Cursor position relative to the Menu center (window px), while Pinned.
@@ -90,6 +90,39 @@ struct App {
     /// The letter standing in for that preview; `begin_pin` shapes it as '?'.
     popover_fallback: char,
 }
+
+/// The Pinned state (ADR-0005): the Menu holds itself up and the mouse is free.
+/// With no Popover open the Tiles are live — draggable, each with a remove
+/// control — and the Hub carries the Dodaj slot's toggle. A Popover is modal
+/// over all of that: while one is open, `popover` is Some and nothing else in
+/// here is touched.
+#[derive(Default)]
+struct Pinned {
+    popover: Option<popover::PopoverState>,
+    drag: Option<Drag>,
+    /// The Tile whose remove control is under the cursor.
+    hover_remove: Option<usize>,
+    /// The Hub's toggle is under the cursor.
+    hover_toggle: bool,
+    /// The Done button is under the cursor.
+    hover_done: bool,
+}
+
+/// A Tile being dragged to a new Slot. Created on mouse-down over a Tile, but
+/// `moved` stays false until the cursor passes the threshold — that is what
+/// keeps a click (which opens the Popover) from being read as a tiny drag.
+struct Drag {
+    /// Item index picked up.
+    from: usize,
+    /// Item index it would land on if dropped now.
+    to: usize,
+    /// Cursor position at mouse-down, Menu-center-relative px.
+    origin: (f32, f32),
+    moved: bool,
+}
+
+/// How far the cursor must travel before a press becomes a drag, px.
+const DRAG_THRESHOLD: f32 = 5.0;
 
 /// 32x32 mint filled circle, the tray icon.
 fn tray_icon_rgba() -> tray_icon::Icon {
@@ -123,7 +156,7 @@ impl App {
                 self.cfg_raw = raw;
                 hook::TRIGGER_XBUTTON.store(cfg.trigger_button.xbutton(), Ordering::Relaxed);
                 launch::set_autostart(cfg.autostart);
-                let geo = MenuGeometry::new(&cfg.appearance, cfg.items.len());
+                let geo = MenuGeometry::new(&cfg);
                 if geo.window_size() != self.geo.window_size() {
                     if let Some(w) = &self.window {
                         let size = geo.window_size();
@@ -150,12 +183,21 @@ impl App {
         self.slot_keys = self.cfg.items.iter().map(IconService::key_for_item).collect();
         for k in 0..self.slot_keys.len() {
             let key = self.slot_keys[k].clone();
+            let slot = self.geo.slot_of_item(k);
             if let Some(Some(icon)) = self.icons.request(key, JobClass::Menu)
                 && let Some(g) = &mut self.gfx
             {
-                g.set_slot_icon(k, &icon);
+                g.set_slot_icon(slot, &icon);
             }
         }
+    }
+
+    fn popover(&self) -> Option<&popover::PopoverState> {
+        self.pinned.as_ref()?.popover.as_ref()
+    }
+
+    fn popover_mut(&mut self) -> Option<&mut popover::PopoverState> {
+        self.pinned.as_mut()?.popover.as_mut()
     }
 
     fn on_icon_ready(&mut self, ready: IconReady) {
@@ -163,16 +205,18 @@ impl App {
         let Some(icon) = &ready.icon else {
             return; // failed: the fallback letter already stands in for it
         };
+        let fallback = self
+            .popover()
+            .map(|ps| ps.final_name().chars().next().unwrap_or('?'));
         if let Some(g) = &mut self.gfx {
             for k in 0..self.slot_keys.len() {
                 if self.slot_keys[k] == ready.key {
-                    g.set_slot_icon(k, icon);
+                    g.set_slot_icon(self.geo.slot_of_item(k), icon);
                 }
             }
             if self.popover_key.as_ref() == Some(&ready.key)
-                && let Some(ps) = &self.pinned
+                && let Some(fallback) = fallback
             {
-                let fallback = ps.final_name().chars().next().unwrap_or('?');
                 g.set_popover_icon(Some(icon), fallback);
             }
         }
@@ -188,7 +232,7 @@ impl App {
         }
         if let Some(path) = path {
             let path = path.to_string_lossy().to_string();
-            if let Some(ps) = &mut self.pinned {
+            if let Some(ps) = self.popover_mut() {
                 match purpose {
                     PickPurpose::Icon => {
                         ps.icon_override = Some(path);
@@ -239,9 +283,10 @@ impl App {
         }
     }
 
-    /// Enter Pinned: the Menu stays up, the window becomes activatable and
-    /// focused, and the add-item Popover expands out of the Dodaj Tile.
-    fn pin(&mut self) {
+    /// Enter Pinned (ADR-0005): the Menu stays up, the window becomes
+    /// activatable and focused, and the mouse is free. No Popover — the Tiles
+    /// are live and the Hub carries the Dodaj slot's toggle.
+    fn pin_bare(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -258,23 +303,66 @@ impl App {
         }
         window.focus_window();
         window.set_ime_allowed(true);
+        self.pinned = Some(Pinned::default());
+        window.request_redraw();
+    }
+
+    /// Open a Popover over Pinned: `Some(i)` edits that Item, `None` adds one.
+    /// Entering Pinned first if we are not already there, so releasing over the
+    /// Dodaj slot still goes straight to the form.
+    fn open_popover(&mut self, edit: Option<usize>) {
+        if self.pinned.is_none() {
+            self.pin_bare();
+        }
+        let Some(pinned) = &mut self.pinned else { return };
 
         // ADR-0002: the window never resizes while the swapchain lives (the AMD
         // driver resets on ResizeBuffers of a DComp swapchain), so the panel
-        // draws centered over the Menu, inside the existing window bounds.
-        let a = self.geo.slot_angle(self.geo.meta_slot());
-        let origin = [a.cos() * self.geo.rest_r(), a.sin() * self.geo.rest_r()];
-        self.pinned = Some(popover::PopoverState::new(
-            popover::Layout::new([0.0, 0.0]),
-            origin,
-        ));
+        // draws centered over the Menu, inside the existing window bounds. It
+        // expands out of the Tile it belongs to.
+        let slot = match edit {
+            Some(i) => self.geo.slot_of_item(i),
+            None => self.geo.meta_slot().unwrap_or(0),
+        };
+        let origin = self.geo.tile_center(slot);
+        let mut ps = popover::PopoverState::new(popover::Layout::new([0.0, 0.0]), origin);
+        if let Some(item) = edit.and_then(|i| self.cfg.items.get(i)) {
+            ps.load(&item.name, &item.target, item.icon.as_deref());
+        }
+        ps.editing = edit;
+        pinned.popover = Some(ps);
+        pinned.drag = None;
+        pinned.hover_remove = None;
         if let Some(g) = &mut self.gfx {
-            g.begin_pin();
+            g.open_popover(edit.is_some());
         }
         self.popover_key = None;
-        self.popover_fallback = '?'; // what begin_pin just shaped
+        self.popover_fallback = '?'; // what open_popover just shaped
         self.refresh_popover_icon();
-        window.request_redraw();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Close the Popover but stay Pinned — the Menu shows the result of what
+    /// just happened instead of vanishing with it.
+    ///
+    /// ponytail: the panel disappears on the frame it closes rather than
+    /// collapsing back into its Tile. The collapse spring exists, but nothing
+    /// drives it: `draw` reads the layout out of the live `PopoverState`, and
+    /// that is gone the moment we return. To animate it out, gfx would have to
+    /// keep the last panel rect and origin alive until the spring settles.
+    fn close_popover(&mut self) {
+        if let Some(p) = &mut self.pinned {
+            p.popover = None;
+        }
+        if let Some(g) = &mut self.gfx {
+            g.close_popover();
+        }
+        self.popover_key = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 
     /// Leave Pinned; `and_close` also plays the normal close animation.
@@ -285,20 +373,176 @@ impl App {
         }
         self.pinned = None;
         if let Some(g) = &mut self.gfx {
-            g.end_pin();
+            g.close_popover();
         }
         if and_close {
             self.close_menu(None);
         }
     }
 
+    /// The one write path for Item mutations (ADR-0006): apply `f` to the
+    /// config the app holds, save it, and rebuild everything that depends on
+    /// the Item list. A future undo hooks in right here.
+    fn mutate(&mut self, f: impl FnOnce(&mut Config)) {
+        f(&mut self.cfg);
+        match config::save(&self.cfg) {
+            Ok(raw) => self.cfg_raw = raw,
+            Err(e) => log!("could not save config: {e}"),
+        }
+        self.geo = MenuGeometry::new(&self.cfg);
+        if let Some(g) = &mut self.gfx {
+            g.set_items(&self.cfg, self.geo);
+        }
+        self.request_item_icons();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Flip the Dodaj slot's `hidden` — what the Hub's toggle does. `position`
+    /// is deliberately untouched, so showing it again puts it back.
+    fn toggle_add_slot(&mut self) {
+        self.mutate(|cfg| cfg.add_slot.hidden = !cfg.add_slot.hidden);
+    }
+
+    /// Cursor moved while the window has focus. A Popover, when open, is modal
+    /// over Pinned: it takes the cursor and the Tiles stay inert.
+    fn cursor_moved(&mut self, rel: (f32, f32)) {
+        let geo = self.geo;
+        let Some(p) = &mut self.pinned else { return };
+        if let Some(ps) = &mut p.popover {
+            ps.hover = ps.layout.hit(rel);
+            return;
+        }
+        if let Some(d) = &mut p.drag {
+            if !d.moved {
+                let (dx, dy) = (rel.0 - d.origin.0, rel.1 - d.origin.1);
+                d.moved = dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD;
+            }
+            if d.moved {
+                // The drop target is the sector under the cursor, reusing the
+                // Menu's own hit-test; the meta sector clamps to an Item.
+                d.to = geo
+                    .hovered_slot((rel.0 as f64, rel.1 as f64), (0.0, 0.0))
+                    .map_or(d.to, |slot| geo.drop_index(slot));
+            }
+            p.hover_remove = None;
+            p.hover_toggle = false;
+            p.hover_done = false;
+        } else {
+            p.hover_remove = (0..geo.slot_count())
+                .find(|&k| geo.item_at(k).is_some() && geo.on_remove(rel, k));
+            p.hover_toggle = geo.on_toggle(rel);
+            p.hover_done = geo.on_done(rel);
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Left button pressed while Pinned. Returns the Popover action to run, if
+    /// the press landed on one.
+    fn pinned_press(&mut self, rel: (f32, f32)) -> Option<popover::Action> {
+        let geo = self.geo;
+        let in_menu = rel.0 * rel.0 + rel.1 * rel.1 < geo.scrim_r() * geo.scrim_r();
+
+        if let Some(ps) = self.popover_mut() {
+            return match ps.layout.hit(rel) {
+                Some(el) => ps.on_click(el),
+                None => {
+                    let in_panel = ps.layout.panel.contains(rel);
+                    (!in_menu && !in_panel).then_some(popover::Action::Discard)
+                }
+            };
+        }
+
+        // The toggle wins over everything else in the Hub.
+        if geo.on_toggle(rel) {
+            self.toggle_add_slot();
+            return None;
+        }
+        // Done: leave Pinned. Same segment the Gear zone used to get here.
+        if geo.on_done(rel) {
+            return Some(popover::Action::Discard);
+        }
+        // A remove control swallows the press: it never starts a drag.
+        if let Some(k) = (0..geo.slot_count())
+            .find(|&k| geo.item_at(k).is_some() && geo.on_remove(rel, k))
+        {
+            self.remove_slot(k);
+            return None;
+        }
+        let slot = geo
+            .hovered_slot((rel.0 as f64, rel.1 as f64), (0.0, 0.0))
+            .filter(|_| in_menu);
+        // The Dodaj slot opens an empty form; it is not draggable.
+        if slot.is_some() && slot == geo.meta_slot() {
+            self.open_popover(None);
+            return None;
+        }
+        // On an Item Tile: arm a drag. Whether this turns out to be a drag or a
+        // click is decided on release, by how far the cursor travelled.
+        if let Some(i) = slot.and_then(|k| geo.item_at(k))
+            && let Some(p) = &mut self.pinned
+        {
+            p.drag = Some(Drag {
+                from: i,
+                to: i,
+                origin: rel,
+                moved: false,
+            });
+            return None;
+        }
+        // Clicking outside the Menu leaves Pinned entirely.
+        (!in_menu).then_some(popover::Action::Discard)
+    }
+
+    /// Left button released while Pinned: finish a drag, or treat it as a click
+    /// on the Tile and open its Popover.
+    fn pinned_release(&mut self) {
+        let Some(p) = &mut self.pinned else { return };
+        let Some(d) = p.drag.take() else { return };
+        if !d.moved {
+            self.open_popover(Some(d.from));
+        } else if d.to != d.from {
+            // Move the springs with the Tile before the rebuild, or it snaps
+            // back to where its Slot used to be.
+            let (from_slot, to_slot) = (self.geo.slot_of_item(d.from), self.geo.slot_of_item(d.to));
+            if let Some(g) = &mut self.gfx {
+                g.reorder_slots(from_slot, to_slot);
+            }
+            self.mutate(|cfg| {
+                if d.from < cfg.items.len() && d.to < cfg.items.len() {
+                    let item = cfg.items.remove(d.from);
+                    cfg.items.insert(d.to, item);
+                }
+            });
+        }
+    }
+
+    /// Start removing Slot `k`'s Item. The Item stays in the config until the
+    /// pop finishes — `Tick::remove_done` is what actually drops it.
+    fn remove_slot(&mut self, k: usize) {
+        if self.geo.item_at(k).is_some()
+            && let Some(g) = &mut self.gfx
+        {
+            g.begin_remove(k);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
     fn popover_action(&mut self, action: popover::Action) {
         match action {
-            popover::Action::Discard => self.unpin(true),
+            // Closing a Popover returns to Pinned; it does not dismiss the Menu.
+            popover::Action::Discard => self.close_popover(),
             popover::Action::Commit => {
-                if let Some(ps) = &self.pinned {
+                if let Some(ps) = self.popover() {
                     // Copy the picked image into the Icon Library now, so the
                     // Item keeps its icon when the original is moved or deleted.
+                    // Editing an Item re-imports the icon it already had, which
+                    // is a no-op: library names are content hashes (ADR-0003).
                     let icon = ps.icon_override.as_ref().map(|p| {
                         match icons::import_to_library(std::path::Path::new(p)) {
                             Ok(stored) => stored.to_string_lossy().to_string(),
@@ -313,11 +557,13 @@ impl App {
                         target: ps.target.text.trim().to_string(),
                         icon,
                     };
-                    if let Err(e) = config::append_item(item, &self.cfg) {
-                        log!("could not save the new item: {e}");
-                    }
+                    let editing = ps.editing;
+                    self.mutate(|cfg| match editing.filter(|&i| i < cfg.items.len()) {
+                        Some(i) => cfg.items[i] = item,
+                        None => cfg.items.push(item),
+                    });
                 }
-                self.unpin(true);
+                self.close_popover();
             }
             popover::Action::Browse | popover::Action::BrowseIcon => {
                 if self.in_dialog {
@@ -358,7 +604,7 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let mut action = None;
-        if let Some(ps) = &mut self.pinned {
+        if let Some(ps) = self.popover_mut() {
             if let Some(k) = mapped {
                 action = ps.on_key(k);
             } else if ctrl && !alt {
@@ -386,7 +632,7 @@ impl App {
     /// A cached icon appears immediately; anything else shows the fallback
     /// letter until the worker reports back.
     fn refresh_popover_icon(&mut self) {
-        let Some(ps) = &self.pinned else { return };
+        let Some(ps) = self.popover() else { return };
         let key = IconService::key_for_popover(&ps.target.text, ps.icon_override.as_deref());
         let fallback = ps.final_name().chars().next().unwrap_or('?');
         if key != self.popover_key {
@@ -495,18 +741,18 @@ impl ApplicationHandler<AppEvent> for App {
                     println!("trigger up, hover = {:?}", self.hover);
                     match self.hover.take() {
                         // Release over Dodaj: pin the Menu, open the Popover.
-                        Some(k) if k == self.geo.meta_slot() => self.pin(),
+                        Some(k) if self.geo.meta_slot() == Some(k) => self.open_popover(None),
                         Some(k) => {
-                            if let Some(item) = self.cfg.items.get(k) {
+                            if let Some(item) =
+                                self.geo.item_at(k).and_then(|i| self.cfg.items.get(i))
+                            {
                                 launch::open(&item.target);
                             }
                             self.close_menu(Some(k));
                         }
-                        // Gear zone: the old "edit the JSON" path.
-                        None if self.gear_hover => {
-                            launch::open(&config::config_path().to_string_lossy());
-                            self.close_menu(None);
-                        }
+                        // ADR-0005: the Gear zone enters Pinned with no Popover
+                        // open. Opening config.json by hand is the tray's job.
+                        None if self.gear_hover => self.pin_bare(),
                         None => self.close_menu(None),
                     }
                 }
@@ -543,41 +789,54 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let (Some(ps), Some(w)) = (&mut self.pinned, &self.window) {
-                    let half = w.inner_size().width as f64 / 2.0;
-                    let rel = ((position.x - half) as f32, (position.y - half) as f32);
-                    self.cursor_rel = rel;
-                    ps.hover = ps.layout.hit(rel);
-                }
+                let Some(w) = &self.window else { return };
+                let half = w.inner_size().width as f64 / 2.0;
+                let rel = ((position.x - half) as f32, (position.y - half) as f32);
+                self.cursor_rel = rel;
+                self.cursor_moved(rel);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                if let Some(ps) = &mut self.pinned {
+                if self.pinned.is_some() {
                     let rel = self.cursor_rel;
-                    let action = match ps.layout.hit(rel) {
-                        Some(el) => ps.on_click(el),
-                        None => {
-                            let in_menu = rel.0 * rel.0 + rel.1 * rel.1
-                                < self.geo.scrim_r() * self.geo.scrim_r();
-                            let in_panel = ps.layout.panel.contains(rel);
-                            (!in_menu && !in_panel).then_some(popover::Action::Discard)
+                    // Clicking away leaves Pinned altogether; anything a
+                    // Popover claims is handled inside it.
+                    match self.pinned_press(rel) {
+                        Some(popover::Action::Discard) if self.popover().is_none() => {
+                            self.unpin(true)
                         }
-                    };
-                    if let Some(a) = action {
-                        self.popover_action(a);
+                        Some(a) => self.popover_action(a),
+                        None => {}
                     }
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.pinned.is_some() {
+                    self.pinned_release();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.pinned.is_some() && event.state == ElementState::Pressed {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                if self.popover().is_some() {
                     self.popover_key(&event);
+                } else if self.pinned.is_some()
+                    && event.logical_key == winit::keyboard::Key::Named(NamedKey::Escape)
+                {
+                    // No Popover to close, so Escape leaves Pinned.
+                    self.unpin(true);
                 }
             }
             WindowEvent::Ime(Ime::Commit(s)) => {
-                if let Some(ps) = &mut self.pinned {
+                if let Some(ps) = self.popover_mut() {
                     ps.insert(&s);
                     self.refresh_popover_icon();
                 }
@@ -585,7 +844,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::DroppedFile(path) => {
                 // Only while Pinned: the press-and-hold Menu holds the mouse
                 // button down, so there is no hand free to drag anything onto it.
-                if let Some(ps) = &mut self.pinned {
+                if let Some(ps) = self.popover_mut() {
                     let path = path.to_string_lossy().to_string();
                     match popover::classify_drop(&path) {
                         popover::DropKind::Image => {
@@ -601,18 +860,47 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let mut removed = None;
                 if let (Some(g), Some(w)) = (&mut self.gfx, &self.window) {
+                    let pinned = self.pinned.as_ref();
+                    let drag = pinned.and_then(|p| p.drag.as_ref()).filter(|d| d.moved).map(|d| {
+                        gfx::DragView {
+                            from: d.from,
+                            to: d.to,
+                            cursor: [self.cursor_rel.0, self.cursor_rel.1],
+                        }
+                    });
                     let view = gfx::MenuView {
                         hover: self.hover,
                         gear_hover: self.gear_hover,
-                        popover: self.pinned.as_ref(),
+                        popover: pinned.and_then(|p| p.popover.as_ref()),
+                        editing: pinned.is_some(),
+                        hover_remove: pinned.and_then(|p| p.hover_remove),
+                        hover_toggle: pinned.is_some_and(|p| p.hover_toggle),
+                        hover_done: pinned.is_some_and(|p| p.hover_done),
+                        add_hidden: self.cfg.add_slot.hidden,
+                        drag,
                     };
                     let tick = g.tick_render(&view);
+                    removed = tick.remove_done;
                     if tick.just_closed {
                         w.set_visible(false);
                     } else if tick.request_frame {
                         w.request_redraw();
                     }
+                }
+                // The pop finished: now the Item actually goes.
+                if let Some(slot) = removed
+                    && let Some(i) = self.geo.item_at(slot)
+                {
+                    if let Some(g) = &mut self.gfx {
+                        g.drop_slot(slot);
+                    }
+                    self.mutate(|cfg| {
+                        if i < cfg.items.len() {
+                            cfg.items.remove(i);
+                        }
+                    });
                 }
             }
             _ => {}
@@ -684,7 +972,7 @@ fn main() {
         let _ = menu_proxy.send_event(AppEvent::Menu(ev));
     }));
 
-    let geo = MenuGeometry::new(&cfg.appearance, cfg.items.len());
+    let geo = MenuGeometry::new(&cfg);
     let proxy = event_loop.create_proxy();
     let mut app = App {
         cfg,

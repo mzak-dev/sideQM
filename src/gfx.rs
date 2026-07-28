@@ -57,8 +57,6 @@ struct TexInstance {
 }
 
 struct Slot {
-    /// Slot angle, radians, screen coords.
-    angle: f32,
     label: String,
     icon: Option<wgpu::BindGroup>,
     /// Fallback glyph when there's no icon: first letter, or "+" for the meta slot.
@@ -74,6 +72,18 @@ pub struct Tick {
     pub request_frame: bool,
     /// The close animation just finished; hide the window now.
     pub just_closed: bool,
+    /// A remove pop finished: drop that Slot's Item now.
+    pub remove_done: Option<usize>,
+}
+
+/// A Tile in flight between two Slots.
+pub struct DragView {
+    /// Item index picked up.
+    pub from: usize,
+    /// Item index it would land on if dropped now.
+    pub to: usize,
+    /// Cursor position, Menu-center-relative px.
+    pub cursor: [f32; 2],
 }
 
 /// Everything main knows that the renderer needs this frame.
@@ -81,6 +91,19 @@ pub struct MenuView<'a> {
     pub hover: Option<usize>,
     pub gear_hover: bool,
     pub popover: Option<&'a PopoverState>,
+    /// Pinned with no Popover open: Tiles carry remove controls and the Hub
+    /// carries the Dodaj slot's toggle.
+    pub editing: bool,
+    /// Slot whose remove control is under the cursor.
+    pub hover_remove: Option<usize>,
+    pub hover_toggle: bool,
+    /// The Done button (Hub's bottom segment) is under the cursor.
+    pub hover_done: bool,
+    /// What the toggle currently reads — the Dodaj slot is hidden.
+    pub add_hidden: bool,
+    /// A Tile is in flight: it follows the cursor instead of its angle, and the
+    /// rest have already sprung to the order the drop would produce.
+    pub drag: Option<DragView>,
 }
 
 /// Popover text buffers, alive only from begin_pin until the next begin_open.
@@ -106,6 +129,8 @@ const POP_BTN_PX: f32 = 13.0;
 const POP_FALLBACK_PX: f32 = 26.0;
 /// Horizontal text padding inside a field.
 const POP_FIELD_PAD: f32 = 9.0;
+/// Caption on the Dodaj slot's toggle, px.
+const TOGGLE_LABEL_PX: f32 = 11.0;
 
 pub struct Gfx {
     surface: wgpu::Surface<'static>,
@@ -132,7 +157,14 @@ pub struct Gfx {
     hub_sub_buf: TextBuffer,
     /// Gear zone glyph (⚙) in the Hub's bottom segment.
     gear_buf: TextBuffer,
-    /// Popover text, created lazily at begin_pin.
+    /// The remove control's glyph. One buffer, drawn once per Tile — the text
+    /// is identical, only the position differs.
+    remove_buf: TextBuffer,
+    /// Caption on the Dodaj slot's toggle, in the Hub while Pinned.
+    toggle_buf: TextBuffer,
+    /// The Done button's caption, in the Hub segment the gear glyph vacates.
+    done_buf: TextBuffer,
+    /// Popover text, created lazily when a Popover opens.
     pop: Option<PopBufs>,
     /// Popover icon-preview texture, when the current target yields one.
     pop_icon: Option<wgpu::BindGroup>,
@@ -396,6 +428,9 @@ impl Gfx {
         let hub_label_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 16.9));
         let hub_sub_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
         let gear_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
+        let remove_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
+        let toggle_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
+        let done_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
 
         let mut gfx = Gfx {
             surface,
@@ -417,6 +452,9 @@ impl Gfx {
             hub_label_buf,
             hub_sub_buf,
             gear_buf,
+            remove_buf,
+            toggle_buf,
+            done_buf,
             pop: None,
             pop_icon: None,
             slots: Vec::new(),
@@ -471,23 +509,55 @@ impl Gfx {
         self.gear_buf
             .shape_until_scroll(&mut self.font_system, false);
 
+        // Remove control and the Dodaj slot's toggle caption — Pinned-only
+        // chrome, sized off the same geometry as everything else.
+        let rm_px = geo.remove_r() * 1.5;
+        self.remove_buf = TextBuffer::new(&mut self.font_system, Metrics::new(rm_px, rm_px));
+        self.remove_buf.set_text(
+            "\u{d7}",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.remove_buf
+            .shape_until_scroll(&mut self.font_system, false);
+        self.toggle_buf = TextBuffer::new(
+            &mut self.font_system,
+            Metrics::new(TOGGLE_LABEL_PX, TOGGLE_LABEL_PX * 1.3),
+        );
+        self.toggle_buf.set_text(
+            "add hidden",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.toggle_buf
+            .shape_until_scroll(&mut self.font_system, false);
+        self.done_buf = TextBuffer::new(
+            &mut self.font_system,
+            Metrics::new(TOGGLE_LABEL_PX, TOGGLE_LABEL_PX * 1.3),
+        );
+        self.done_buf.set_text(
+            "done",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.done_buf
+            .shape_until_scroll(&mut self.font_system, false);
+
         let total = geo.slot_count();
         self.animator.set_slot_count(total);
 
         let glyph_px = geo.glyph_px();
         let mut slots = Vec::with_capacity(total);
-        for (k, name, is_meta) in cfg
-            .items
-            .iter()
-            .enumerate()
-            .map(|(k, it)| (k, it.name.clone(), false))
-            .chain(std::iter::once((
-                cfg.items.len(),
-                "Dodaj".to_string(),
-                true,
-            )))
-        {
-            let angle = geo.slot_angle(k);
+        // Slot order comes from the geometry, not from the Item list: the
+        // Dodaj slot can sit first, last, or nowhere at all.
+        for k in 0..total {
+            let (name, is_meta) = match geo.item_at(k) {
+                Some(i) => (cfg.items[i].name.clone(), false),
+                None => ("Dodaj".to_string(), true),
+            };
             let letter = {
                 let ch = if is_meta {
                     "+".to_string()
@@ -521,7 +591,6 @@ impl Gfx {
             );
             label_buf.shape_until_scroll(&mut self.font_system, false);
             slots.push(Slot {
-                angle,
                 label: name,
                 icon: None,
                 letter,
@@ -554,8 +623,9 @@ impl Gfx {
         self.animator.begin_close(launched);
     }
 
-    /// Pinned started: build the Popover's text buffers and start its spring.
-    pub fn begin_pin(&mut self) {
+    /// A Popover opened: build its text buffers and start its spring. Pinned
+    /// itself needs nothing from here — entering it draws no new resources.
+    pub fn open_popover(&mut self, editing: bool) {
         let fs = &mut self.font_system;
         let attrs = Attrs::new().family(Family::Monospace);
         let mk = |fs: &mut FontSystem, px: f32, text: &str| {
@@ -571,21 +641,39 @@ impl Gfx {
             lbl_target: mk(fs, POP_LABEL_PX, "cel"),
             browse: mk(fs, POP_BTN_PX, "\u{2026}"),
             icon_btn: mk(fs, POP_BTN_PX, "ikona\u{2026}"),
-            commit: mk(fs, POP_BTN_PX, "dodaj"),
+            commit: mk(fs, POP_BTN_PX, if editing { "zapisz" } else { "dodaj" }),
             cancel: mk(fs, POP_BTN_PX, "anuluj"),
             fallback: mk(fs, POP_FALLBACK_PX, "?"),
             generation: u64::MAX, // force the first reshape
         });
         self.pop_icon = None;
-        self.animator.begin_pin();
+        self.animator.open_popover();
     }
 
-    /// Pinned ended: collapse the Popover spring and free its text/icon
-    /// resources now, rather than holding them until the next begin_open.
-    pub fn end_pin(&mut self) {
-        self.animator.end_pin();
+    /// The Popover closed: collapse its spring and free its text/icon resources
+    /// now, rather than holding them until the next begin_open.
+    pub fn close_popover(&mut self) {
+        self.animator.close_popover();
         self.pop = None;
         self.pop_icon = None;
+    }
+
+    /// Start the remove pop on a Slot. The Item is dropped only once
+    /// `Tick::remove_done` reports the pop finished.
+    pub fn begin_remove(&mut self, slot: usize) {
+        self.animator.begin_remove(slot);
+    }
+
+    /// The Slot is going away: take its springs with it, so the Tiles after it
+    /// keep their own animation state instead of inheriting the popped one's.
+    pub fn drop_slot(&mut self, slot: usize) {
+        self.animator.drop_slot(slot);
+    }
+
+    /// A drag committed: carry the Tile's springs to its new Slot so it stays
+    /// where the drag left it on screen instead of snapping.
+    pub fn reorder_slots(&mut self, from: usize, to: usize) {
+        self.animator.reorder_slots(from, to);
     }
 
     /// Icon preview for the Popover's current target: a texture when one has
@@ -617,13 +705,15 @@ impl Gfx {
         let dt = (now - self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
 
+        let angles = self.target_angles(view.drag.as_ref());
         let frame = self
             .animator
-            .tick(dt, view.hover, &self.geo, &self.cfg.animation);
+            .tick(dt, view.hover, &self.geo, &self.cfg.animation, &angles);
         if !frame.request_frame {
             return Tick {
                 request_frame: false,
                 just_closed: frame.just_closed,
+                remove_done: frame.remove_done,
             };
         }
 
@@ -675,7 +765,23 @@ impl Gfx {
         Tick {
             request_frame: true,
             just_closed: false,
+            remove_done: frame.remove_done,
         }
+    }
+
+    /// Where each Tile belongs this frame. The resting angles, unless a drag is
+    /// in flight — then every other Tile has already moved to the arrangement
+    /// the drop would produce, so the preview cannot disagree with the result.
+    fn target_angles(&self, drag: Option<&DragView>) -> Vec<f32> {
+        let g = &self.geo;
+        let mut out: Vec<f32> = (0..g.slot_count()).map(|k| g.slot_angle(k)).collect();
+        if let Some(d) = drag {
+            for i in 0..g.item_count() {
+                let moved = crate::geometry::moved_index(i, d.from, d.to);
+                out[g.slot_of_item(i)] = g.slot_angle(g.slot_of_item(moved));
+            }
+        }
+        out
     }
 
     fn upload_icon(&self, icon: &icons::RgbaIcon) -> wgpu::BindGroup {
@@ -784,19 +890,34 @@ impl Gfx {
         let n = self.geo.slot_count().max(1);
         let scrim_r = self.geo.scrim_r();
         let rest_r = self.geo.rest_r();
-        let hub_r = self.geo.hub_r();
+        // While Pinned the Hub has to hold the Dodaj slot's toggle, so it draws
+        // at its floored radius. Outside Pinned this is the plain configured
+        // value — the Dead zone and Gear zone must not move (see hub_r_pinned).
+        let hub_r = if view.editing {
+            self.geo.hub_r_pinned()
+        } else {
+            self.geo.hub_r()
+        };
 
-        // Per-slot animated values: (position, scale, alpha). Tiles always sit
-        // at rest_r now — no more cursor-driven outward shift.
-        let tiles: Vec<([f32; 2], f32, f32)> = self
+        // Per-slot animated values: (position, scale, alpha). Tiles sit at
+        // rest_r on their sprung angle — except the one being dragged, which
+        // rides the cursor.
+        let dragged_slot = view
+            .drag
+            .as_ref()
+            .map(|d| self.geo.slot_of_item(d.from));
+        let tiles: Vec<([f32; 2], f32, f32)> = frame
             .slots
             .iter()
-            .zip(&frame.slots)
-            .map(|(slot, sf)| {
-                let pos = [
-                    center + slot.angle.cos() * rest_r,
-                    center + slot.angle.sin() * rest_r,
-                ];
+            .enumerate()
+            .map(|(k, sf)| {
+                let pos = match (&view.drag, dragged_slot == Some(k)) {
+                    (Some(d), true) => [center + d.cursor[0], center + d.cursor[1]],
+                    _ => [
+                        center + sf.angle.cos() * rest_r,
+                        center + sf.angle.sin() * rest_r,
+                    ],
+                };
                 (pos, sf.scale, sf.alpha)
             })
             .collect();
@@ -827,18 +948,21 @@ impl Gfx {
                 ..Default::default()
             },
         ];
-        // Gear zone: the Hub's bottom segment; release there opens config.json.
-        shapes.push(ShapeInstance {
-            pos: [center, center],
-            half: [hub_r, hub_r],
-            fill: self.col(
-                if view.gear_hover { accent } else { white },
-                (if view.gear_hover { 0.14 } else { 0.05 }) * scrim_alpha,
-            ),
-            kind: 2.0,
-            angle_center: self.geo.gear_cut_dy(),
-            ..Default::default()
-        });
+        // Gear zone: the Hub's bottom segment; release there enters Pinned.
+        // Once Pinned, the Hub belongs to the toggle instead.
+        if !view.editing {
+            shapes.push(ShapeInstance {
+                pos: [center, center],
+                half: [hub_r, hub_r],
+                fill: self.col(
+                    if view.gear_hover { accent } else { white },
+                    (if view.gear_hover { 0.14 } else { 0.05 }) * scrim_alpha,
+                ),
+                kind: 2.0,
+                angle_center: self.geo.gear_cut_dy(),
+                ..Default::default()
+            });
+        }
         for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
             if scale < 0.01 || alpha < 0.01 || (self.slots[k].is_meta && pop_active) {
                 continue;
@@ -860,6 +984,76 @@ impl Gfx {
                 ..Default::default()
             });
         }
+        // --- Pinned chrome: a remove control per Item Tile, and the Dodaj
+        // slot's toggle in the Hub. Both are inert while a Popover is open,
+        // and drawing them then would only compete with the panel. ---
+        let remove_r = self.geo.remove_r();
+        let danger = [0.878, 0.353, 0.353]; // #E05A5A
+        if view.editing && !pop_active {
+            for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
+                if self.slots.get(k).is_none_or(|s| s.is_meta) || scale < 0.01 || alpha < 0.01 {
+                    continue;
+                }
+                let hovered = view.hover_remove == Some(k);
+                shapes.push(ShapeInstance {
+                    pos: [
+                        pos[0] + tile_half * 0.85 * scale,
+                        pos[1] - tile_half * 0.85 * scale,
+                    ],
+                    half: [remove_r, remove_r],
+                    corner: remove_r,
+                    border: 1.1,
+                    fill: self.col(if hovered { danger } else { hub_bg }, 0.95 * alpha),
+                    border_color: self.col(if hovered { danger } else { white }, 0.35 * alpha),
+                    ..Default::default()
+                });
+            }
+            // Toggle: track + knob, the knob sliding to the "on" end when the
+            // Dodaj slot is hidden.
+            let (track_w, track_h) = (30.0, 16.0);
+            let track_cy = center + 9.0;
+            let on = view.add_hidden;
+            shapes.push(ShapeInstance {
+                pos: [center, track_cy],
+                half: [track_w / 2.0, track_h / 2.0],
+                corner: track_h / 2.0,
+                border: 1.1,
+                fill: self.col(
+                    if on { accent } else { white },
+                    (if on { 0.75 } else { 0.08 }) * scrim_alpha,
+                ),
+                border_color: self.col(
+                    if view.hover_toggle { accent } else { white },
+                    (if view.hover_toggle { 0.7 } else { 0.18 }) * scrim_alpha,
+                ),
+                ..Default::default()
+            });
+            let knob_r = track_h / 2.0 - 2.5;
+            shapes.push(ShapeInstance {
+                pos: [
+                    center + if on { track_w / 4.0 } else { -track_w / 4.0 },
+                    track_cy,
+                ],
+                half: [knob_r, knob_r],
+                corner: knob_r,
+                fill: self.col(if on { hub_bg } else { white }, 0.9 * scrim_alpha),
+                ..Default::default()
+            });
+            // Done: the way out, in the same segment the Gear zone (the way in)
+            // occupies outside Pinned.
+            shapes.push(ShapeInstance {
+                pos: [center, center],
+                half: [hub_r, hub_r],
+                fill: self.col(
+                    if view.hover_done { accent } else { white },
+                    (if view.hover_done { 0.18 } else { 0.06 }) * scrim_alpha,
+                ),
+                kind: 2.0,
+                angle_center: self.geo.done_cut_dy(),
+                ..Default::default()
+            });
+        }
+
         if let Some((arc_angle, arc_alpha)) = frame.arc {
             shapes.push(ShapeInstance {
                 pos: [center, center],
@@ -1065,21 +1259,25 @@ impl Gfx {
                 custom_glyphs: &[],
             });
         }
-        let name_w = self
-            .hub_label_buf
-            .layout_runs()
-            .map(|r| r.line_w)
-            .fold(0.0f32, f32::max);
-        areas.push(TextArea {
-            buffer: &self.hub_label_buf,
-            left: center - name_w / 2.0,
-            top: center - label_font_px * 0.7,
-            scale: 1.0,
-            bounds: full_bounds,
-            default_color: rgba(if hover.is_some() { accent } else { hub_dot }, scrim_alpha),
-            custom_glyphs: &[],
-        });
-        if hover.is_some() {
+        // The Hub's idle dot / selected name, and the gear glyph, belong to the
+        // press-and-hold Menu. While Pinned the Hub is the toggle's.
+        if !view.editing {
+            let name_w = self
+                .hub_label_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            areas.push(TextArea {
+                buffer: &self.hub_label_buf,
+                left: center - name_w / 2.0,
+                top: center - label_font_px * 0.7,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: rgba(if hover.is_some() { accent } else { hub_dot }, scrim_alpha),
+                custom_glyphs: &[],
+            });
+        }
+        if hover.is_some() && !view.editing {
             let sub_w = self
                 .hub_sub_buf
                 .layout_runs()
@@ -1096,7 +1294,7 @@ impl Gfx {
             });
         }
         // Gear glyph, centered in the Hub's bottom segment.
-        {
+        if !view.editing {
             let gear_w = self
                 .gear_buf
                 .layout_runs()
@@ -1113,6 +1311,71 @@ impl Gfx {
                 default_color: rgba(if view.gear_hover { accent } else { hub_dot }, scrim_alpha),
                 custom_glyphs: &[],
             });
+        } else if !pop_active {
+            // Toggle caption, above the switch.
+            let w = self
+                .toggle_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            areas.push(TextArea {
+                buffer: &self.toggle_buf,
+                left: center - w / 2.0,
+                top: center - TOGGLE_LABEL_PX * 1.5,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: rgba(
+                    if view.hover_toggle { accent } else { idle_text },
+                    scrim_alpha,
+                ),
+                custom_glyphs: &[],
+            });
+            // Done caption, centered in the Hub's bottom segment.
+            let done_w = self
+                .done_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            let seg_cy = center + (self.geo.done_cut_dy() + hub_r) / 2.0;
+            areas.push(TextArea {
+                buffer: &self.done_buf,
+                left: center - done_w / 2.0,
+                top: seg_cy - TOGGLE_LABEL_PX * 0.62,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: rgba(
+                    if view.hover_done { accent } else { idle_text },
+                    scrim_alpha,
+                ),
+                custom_glyphs: &[],
+            });
+            // One glyph buffer, drawn once per removable Tile.
+            let rm_w = self
+                .remove_buf
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0f32, f32::max);
+            for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
+                if self.slots.get(k).is_none_or(|s| s.is_meta) || scale < 0.01 || alpha < 0.01 {
+                    continue;
+                }
+                areas.push(TextArea {
+                    buffer: &self.remove_buf,
+                    left: pos[0] + tile_half * 0.85 * scale - rm_w / 2.0,
+                    top: pos[1] - tile_half * 0.85 * scale - remove_r * 0.95,
+                    scale: 1.0,
+                    bounds: full_bounds,
+                    default_color: rgba(
+                        if view.hover_remove == Some(k) {
+                            white
+                        } else {
+                            idle_text
+                        },
+                        alpha,
+                    ),
+                    custom_glyphs: &[],
+                });
+            }
         }
         // Popover text: labels, field contents (clipped + caret-scrolled),
         // button captions, and the icon-preview fallback letter.

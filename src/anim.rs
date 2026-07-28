@@ -24,6 +24,12 @@ const ARC_RESPONSE_S: f32 = 0.45;
 const ARC_FADE_S: f32 = 0.15;
 /// Popover expand/collapse spring, shares the open damping.
 const POPOVER_RESPONSE_S: f32 = 0.35;
+/// Tile angle spring — how long a Tile takes to glide to a new Slot after a
+/// reorder, an add, or a remove. Shares the open damping, so `bounciness`
+/// governs the overshoot here too.
+const ANGLE_RESPONSE_S: f32 = 0.3;
+/// The "pop" a Tile shrinks with when its Item is removed.
+const REMOVE_RESPONSE_S: f32 = 0.18;
 
 /// Damped spring toward a target; the whole animation system is these.
 #[derive(Clone, Copy, Default)]
@@ -74,6 +80,9 @@ pub struct SlotFrame {
     pub scale: f32,
     /// Tile opacity, from the entrance spring alone.
     pub alpha: f32,
+    /// Where the Tile actually sits this frame, radians. Trails the target
+    /// angle, so reordering and hiding the Dodaj slot glide instead of jumping.
+    pub angle: f32,
 }
 
 /// Everything the renderer needs for one frame, as plain data.
@@ -91,6 +100,10 @@ pub struct FrameModel {
     pub request_frame: bool,
     /// The close animation just finished; hide the window now.
     pub just_closed: bool,
+    /// A removed Tile finished shrinking: drop its Item now. The Item outlives
+    /// its own removal by exactly one pop, so there is something left to
+    /// animate — deleting it up front would leave nothing to shrink.
+    pub remove_done: Option<usize>,
 }
 
 impl FrameModel {
@@ -103,6 +116,7 @@ impl FrameModel {
             popover: 0.0,
             request_frame: false,
             just_closed,
+            remove_done: None,
         }
     }
 }
@@ -126,9 +140,17 @@ pub struct Animator {
     /// Captured at begin_close so the launched tile can pop while everything
     /// else fades, even though `hover` itself is cleared right after.
     closing_launched: Option<usize>,
-    /// Popover expansion toward 1 while Pinned, back toward 0 otherwise.
+    /// Popover expansion toward 1 while one is open, back toward 0 otherwise.
     popover_spring: Spring,
-    pinned: bool,
+    popover_open: bool,
+    /// Per-tile angle. Unwrapped like `arc_target`, so a tile that moves across
+    /// the 12 o'clock seam takes the short way round.
+    angle_springs: Vec<Spring>,
+    /// False until the first tick places the tiles; the first set of angles
+    /// snaps rather than springing in from zero.
+    angles_placed: bool,
+    /// The Slot whose Tile is popping out on its way to being removed.
+    removing: Option<usize>,
 }
 
 impl Animator {
@@ -145,24 +167,78 @@ impl Animator {
             last_hover: None,
             closing_launched: None,
             popover_spring: Spring::default(),
-            pinned: false,
+            popover_open: false,
+            angle_springs: Vec::new(),
+            angles_placed: false,
+            removing: None,
         }
     }
 
-    /// The Popover starts expanding out of the Dodaj Tile (Pinned state).
-    pub fn begin_pin(&mut self) {
-        self.pinned = true;
+    /// Start the remove pop on `slot`. The caller drops the Item only once the
+    /// resulting `FrameModel::remove_done` says the pop has played out.
+    pub fn begin_remove(&mut self, slot: usize) {
+        // One at a time: a second X mid-pop would strand the first Tile at
+        // whatever scale it had reached, with its Item still in the config.
+        if self.removing.is_none() && slot < self.tile_springs.len() {
+            self.removing = Some(slot);
+        }
     }
 
-    /// Pinned ended (commit, discard, or Trigger restart): collapse the Popover.
-    pub fn end_pin(&mut self) {
-        self.pinned = false;
+    /// A Popover opened: start expanding it out of its Tile.
+    pub fn open_popover(&mut self) {
+        self.popover_open = true;
     }
 
-    /// Resize per-slot springs after the Slot count changed (config reload).
+    /// The Popover closed (commit, discard, or leaving Pinned): collapse it.
+    pub fn close_popover(&mut self) {
+        self.popover_open = false;
+    }
+
+    /// Resize per-slot springs after the Slot count changed (config reload, an
+    /// Item added or removed, the Dodaj slot shown or hidden).
+    ///
+    /// Existing springs keep their state: growing the Menu must not restart the
+    /// tiles that were already on screen, or adding one Item would re-animate
+    /// all the others. Fresh entries start collapsed, which is what makes a new
+    /// Tile pop in — and `angles_placed` stays true, so they spring to their
+    /// angle from wherever the resize left them instead of snapping.
     pub fn set_slot_count(&mut self, n: usize) {
-        self.tile_springs = vec![Spring::default(); n];
-        self.select_springs = vec![Spring::default(); n];
+        self.tile_springs.resize(n, Spring::default());
+        self.select_springs.resize(n, Spring::default());
+        self.angle_springs.resize(n, Spring::default());
+    }
+
+    /// Drop a Slot's springs, for a Slot that is going away rather than the
+    /// list merely getting shorter.
+    ///
+    /// `set_slot_count` truncates, which is wrong here: removing the Item in
+    /// the middle would leave the popped-to-nothing spring sitting at that
+    /// index while a different Item moved into it, and that Item would be
+    /// invisible. Every spring past `k` has to shift down with its Tile.
+    pub fn drop_slot(&mut self, k: usize) {
+        if k < self.tile_springs.len() {
+            self.tile_springs.remove(k);
+            self.select_springs.remove(k);
+            self.angle_springs.remove(k);
+        }
+    }
+
+    /// Move a Slot's springs the same way its Item just moved. Without this the
+    /// Tiles keep the angles the drag left them at while the labels underneath
+    /// them shuffle, so a committed reorder looks like every Tile jumped.
+    pub fn reorder_slots(&mut self, from: usize, to: usize) {
+        let n = self.tile_springs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        for v in [
+            &mut self.tile_springs,
+            &mut self.select_springs,
+            &mut self.angle_springs,
+        ] {
+            let s = v.remove(from);
+            v.insert(to, s);
+        }
     }
 
     /// Start (or restart) the entrance. Reopening mid-close keeps the current
@@ -182,7 +258,11 @@ impl Animator {
             self.last_hover = None;
             self.closing_launched = None;
             self.popover_spring = Spring::default();
-            self.pinned = false;
+            self.popover_open = false;
+            self.removing = None;
+            // The tiles are off screen, so the next frame's angles are a fresh
+            // placement, not a move: snap to them instead of gliding in.
+            self.angles_placed = false;
         }
         self.phase = Phase::Shown { elapsed: 0.0 };
     }
@@ -198,12 +278,16 @@ impl Animator {
     }
 
     /// Advance all springs by `dt` seconds and describe the resulting frame.
+    /// `angles` is where each Tile belongs this frame, one per slot spring. It
+    /// comes from the caller rather than from `geo` because mid-drag the Tiles
+    /// are in an order the config does not know about yet.
     pub fn tick(
         &mut self,
         dt: f32,
         hover: Option<usize>,
         geo: &MenuGeometry,
         cfg: &Animation,
+        angles: &[f32],
     ) -> FrameModel {
         let n = self.tile_springs.len().max(1);
         // Accessors, not fields: these come from user-edited JSON and a stiff
@@ -214,18 +298,35 @@ impl Animator {
         let omega_close = 4.0 / (close_ms.max(1) as f32 / 1000.0);
         let stagger = cfg.stagger_ms() as f32 / 1000.0;
 
+        let mut remove_done = None;
         if let Phase::Shown { elapsed } = &mut self.phase {
             *elapsed += dt;
         }
         match self.phase {
             Phase::Closed => return FrameModel::idle(hover, false),
             Phase::Shown { elapsed } => {
+                let removing = self.removing;
+                let omega_remove = 4.0 / (zeta_open * REMOVE_RESPONSE_S);
                 for (k, s) in self.tile_springs.iter_mut().enumerate() {
-                    if open_ms == 0 {
+                    if removing == Some(k) {
+                        // The pop: shrink away, sharing `bounciness` with
+                        // everything else so a calm config stays calm.
+                        if open_ms == 0 {
+                            *s = Spring::default();
+                        } else {
+                            s.tick(0.0, omega_remove, zeta_open, dt);
+                        }
+                    } else if open_ms == 0 {
                         *s = Spring { x: 1.0, v: 0.0 };
                     } else if elapsed >= k as f32 * stagger {
                         s.tick(1.0, omega_open, zeta_open, dt);
                     }
+                }
+                if let Some(k) = removing
+                    && self.tile_springs[k].settled(0.0)
+                {
+                    self.removing = None;
+                    remove_done = Some(k);
                 }
                 // The Scrim starts once ~60% of the tiles have begun landing.
                 if open_ms == 0 {
@@ -312,21 +413,42 @@ impl Animator {
 
         let omega_popover = 4.0 / (zeta_open * POPOVER_RESPONSE_S);
         self.popover_spring.tick(
-            if self.pinned { 1.0 } else { 0.0 },
+            if self.popover_open { 1.0 } else { 0.0 },
             omega_popover,
             zeta_open,
             dt,
         );
 
+        // --- tile angles: each Tile glides to wherever it belongs now. The
+        // target is unwrapped against the spring's current position, so a Tile
+        // crossing the 12 o'clock seam takes the short way round instead of
+        // unwinding the long way. ---
+        let omega_angle = 4.0 / (zeta_open * ANGLE_RESPONSE_S);
+        let placed = self.angles_placed;
+        for (k, s) in self.angle_springs.iter_mut().enumerate() {
+            let Some(&target) = angles.get(k) else { continue };
+            if !placed {
+                *s = Spring { x: target, v: 0.0 };
+            } else {
+                let delta = ((target - s.x + PI).rem_euclid(TAU)) - PI;
+                s.tick(s.x + delta, omega_angle, zeta_open, dt);
+            }
+        }
+        if !angles.is_empty() {
+            self.angles_placed = true;
+        }
+
         let slots = self
             .tile_springs
             .iter()
             .zip(&self.select_springs)
-            .map(|(tile, select)| {
+            .enumerate()
+            .map(|(k, (tile, select))| {
                 let intro = tile.x.max(0.0);
                 SlotFrame {
                     scale: intro * select.x,
                     alpha: intro.clamp(0.0, 1.0),
+                    angle: self.angle_springs.get(k).map(|s| s.x).unwrap_or_default(),
                 }
             })
             .collect();
@@ -339,6 +461,7 @@ impl Animator {
             popover: self.popover_spring.x.max(0.0),
             request_frame: true,
             just_closed: false,
+            remove_done,
         }
     }
 }
@@ -346,11 +469,25 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Appearance;
     use std::f32::consts::FRAC_PI_2;
 
     fn geo(item_count: usize) -> MenuGeometry {
-        MenuGeometry::new(&Appearance::default(), item_count)
+        let cfg = crate::config::Config {
+            items: std::iter::repeat_with(|| crate::config::Item {
+                name: "x".into(),
+                target: "x".into(),
+                icon: None,
+            })
+            .take(item_count)
+            .collect(),
+            ..Default::default()
+        };
+        MenuGeometry::new(&cfg)
+    }
+
+    /// Resting angles — every tile where the config says it belongs.
+    fn angs(g: &MenuGeometry) -> Vec<f32> {
+        (0..g.slot_count()).map(|k| g.slot_angle(k)).collect()
     }
 
     fn cfg() -> Animation {
@@ -379,11 +516,77 @@ mod tests {
         secs: f32,
     ) -> FrameModel {
         let steps = (secs / 0.01).round() as usize;
-        let mut last = a.tick(0.0, hover, g, c);
+        let mut last = a.tick(0.0, hover, g, c, &angs(g));
         for _ in 0..steps {
-            last = a.tick(0.01, hover, g, c);
+            last = a.tick(0.01, hover, g, c, &angs(g));
         }
         last
+    }
+
+    /// The Item outlives its own removal by exactly one pop. If `remove_done`
+    /// fired immediately there would be nothing left to animate; if it never
+    /// fired the Item would never actually go.
+    #[test]
+    fn a_removed_tile_pops_before_its_item_is_dropped() {
+        let (g, c) = (geo(3), cfg()); // 3 Items + the Dodaj slot
+        let mut a = opened(4);
+        run(&mut a, &g, &c, None, 2.0); // everything settled at scale 1
+
+        a.begin_remove(1);
+        let first = a.tick(0.01, None, &g, &c, &angs(&g));
+        assert_eq!(first.remove_done, None, "removed before it could pop");
+
+        let mut done = None;
+        let mut ticks = 1;
+        for _ in 0..400 {
+            let f = a.tick(0.01, None, &g, &c, &angs(&g));
+            ticks += 1;
+            assert!(f.slots[1].scale.is_finite());
+            if let Some(k) = f.remove_done {
+                done = Some(k);
+                break;
+            }
+        }
+        assert_eq!(done, Some(1));
+        assert!(ticks > 5, "the pop was instant ({ticks} ticks)");
+
+        // The surviving Tiles keep their own state: dropping the popped slot
+        // shifts them down rather than truncating the list.
+        a.drop_slot(1);
+        let f = a.tick(0.01, None, &g, &c, &angs(&g));
+        assert_eq!(f.slots.len(), 3);
+        assert!(
+            f.slots[1].scale > 0.9,
+            "survivor inherited the popped slot's spring: {}",
+            f.slots[1].scale
+        );
+    }
+
+    /// Tiles glide to their angles instead of teleporting, and a committed
+    /// reorder carries a Tile's angle spring with it.
+    #[test]
+    fn tiles_spring_to_their_angles_and_carry_them_when_reordered() {
+        let (g, c) = (geo(3), cfg());
+        let mut a = opened(4);
+        // First placement snaps: the tiles are entering, not moving.
+        let f = a.tick(0.01, None, &g, &c, &angs(&g));
+        assert!((f.slots[1].angle - g.slot_angle(1)).abs() < 1e-3);
+
+        // Retarget slot 1 to slot 3's angle: it has to travel, not jump.
+        let mut moved = angs(&g);
+        moved[1] = g.slot_angle(3);
+        let f = a.tick(0.01, None, &g, &c, &moved);
+        let after_one_tick = f.slots[1].angle;
+        assert!(
+            (after_one_tick - g.slot_angle(3)).abs() > 1e-3,
+            "angle teleported instead of springing"
+        );
+
+        // Reordering moves the spring with the Tile, so the Tile stays put on
+        // screen while its Slot index changes underneath it.
+        a.reorder_slots(1, 2);
+        let f = a.tick(0.0, None, &g, &c, &angs(&g));
+        assert!((f.slots[2].angle - after_one_tick).abs() < 0.05);
     }
 
     #[test]
@@ -416,7 +619,7 @@ mod tests {
             ..cfg()
         };
         let mut a = opened(4);
-        let frame = a.tick(0.01, None, &g, &c);
+        let frame = a.tick(0.01, None, &g, &c, &angs(&g));
         assert!(frame.slots.iter().all(|s| s.alpha == 1.0));
         assert_eq!(frame.scrim, 1.0);
     }
@@ -428,9 +631,9 @@ mod tests {
         // the unwrapped target must land at -PI, not +PI.
         let (g, c) = (geo(3), cfg());
         let mut a = opened(4);
-        a.tick(0.01, Some(0), &g, &c);
+        a.tick(0.01, Some(0), &g, &c, &angs(&g));
         assert!((a.arc_target - (-FRAC_PI_2)).abs() < 1e-5);
-        a.tick(0.01, Some(3), &g, &c);
+        a.tick(0.01, Some(3), &g, &c, &angs(&g));
         assert!((a.arc_target - (-PI)).abs() < 1e-5);
     }
 
@@ -442,12 +645,12 @@ mod tests {
             ..cfg()
         };
         let mut a = opened(4);
-        a.tick(0.01, None, &g, &cfg());
+        a.tick(0.01, None, &g, &cfg(), &angs(&g));
         a.begin_close(None);
-        let closing = a.tick(0.01, None, &g, &c);
+        let closing = a.tick(0.01, None, &g, &c, &angs(&g));
         assert!(closing.just_closed);
         assert!(!closing.request_frame);
-        let after = a.tick(0.01, None, &g, &c);
+        let after = a.tick(0.01, None, &g, &c, &angs(&g));
         assert!(!after.just_closed);
         assert!(!after.request_frame);
     }
@@ -457,10 +660,10 @@ mod tests {
         let (g, c) = (geo(3), cfg());
         let mut a = opened(4);
         assert_eq!(run(&mut a, &g, &c, None, 0.5).popover, 0.0);
-        a.begin_pin();
+        a.open_popover();
         let frame = run(&mut a, &g, &c, None, 1.5);
         assert!((frame.popover - 1.0).abs() < 0.05);
-        a.end_pin();
+        a.close_popover();
         let frame = run(&mut a, &g, &c, None, 1.5);
         assert!(frame.popover < 0.05);
     }
@@ -488,7 +691,7 @@ mod tests {
             let mut a = opened(12);
             // Long frames too: dt is capped at 0.05 by the render loop.
             for _ in 0..400 {
-                let f = a.tick(0.05, Some(3), &g, &c);
+                let f = a.tick(0.05, Some(3), &g, &c, &angs(&g));
                 assert!(f.scrim.is_finite(), "scrim diverged");
                 assert!(f.popover.is_finite(), "popover diverged");
                 if let Some((angle, alpha)) = f.arc {

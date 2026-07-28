@@ -18,11 +18,15 @@ A user-configured launch target (exe, URL, folder, document).
 _Avoid_: app, shortcut, entry
 
 **Slot**:
-One angular position on the Menu; shows either an Item or the meta "Dodaj" slot (always last, so its clock position shifts with the Item count).
+One angular position on the Menu; shows either an Item or the meta "Dodaj" slot. Slots divide the circle evenly, so every Slot's clock position shifts with the Slot count.
 _Avoid_: sector, position
 
+**Dodaj slot**:
+The meta Slot that opens the Popover on an empty form. Two independent things are true of it: where it sits (first or last among the Slots) and whether it shows at all. Hiding it never forgets where it sat, so showing it again puts it back. Hidden, the Menu is Items only, and the Hub's toggle is the way to get it back.
+_Avoid_: add button, plus tile, new-item slot
+
 **Tile**:
-The visual square representing a Slot (icon or fallback letter), plus its always-visible caption underneath.
+The visual square representing a Slot (icon or fallback letter), plus its always-visible caption underneath. While Pinned it gains two affordances an Item Tile has nowhere else: it can be dragged to another Slot, and it carries a remove control in its corner. The Dodaj slot's Tile has neither.
 _Avoid_: button, icon box
 
 **Icon**:
@@ -38,7 +42,7 @@ The Menu's neutral backdrop circle (a faint fill, a barely-there border) that ev
 _Avoid_: ring, border, circle edge
 
 **Hub**:
-The circle at the Menu's center. Idle, it shows a dot; while a Slot is Hovered, it shows that Item's name and a "release to launch" subtitle.
+The circle at the Menu's center, and the Menu's one piece of chrome. Idle, it shows a dot; while a Slot is Hovered, it shows that Item's name and a "release to launch" subtitle; while Pinned with no Popover open, it shows the Dodaj slot's toggle — and there it is never drawn smaller than that toggle needs, however small the configured Hub is. A Popover, when open, covers it entirely.
 _Avoid_: center dot, puck
 
 **Arc**:
@@ -62,16 +66,20 @@ The per-Slot delay applied during the open and close animations.
 _Avoid_: cascade, sequence delay
 
 **Pinned**:
-The Menu state entered by releasing the Trigger over the "Dodaj" Slot: the Menu stays up without the Trigger held, the window takes keyboard focus, and the Popover is open. Clicking away, Escape, commit, or a fresh Trigger press leaves it.
+The Menu state where it stays up without the Trigger held: the window takes keyboard focus and the mouse is free. Entered by releasing the Trigger over the "Dodaj" Slot or in the Gear zone. Left by the Done button, clicking outside the Menu, Escape, or a fresh Trigger press — committing a Popover does not. Pinned is a state in its own right; a Popover may or may not be open over it.
 _Avoid_: sticky mode, edit mode
 
 **Popover**:
-The inline add-item form (name, target, browse, icon picker, commit/cancel) that expands out of the "Dodaj" Tile while Pinned.
+The inline item form (name, target, browse, icon picker, commit/cancel) that expands out of a Tile while Pinned. It either adds a new Item or edits an existing one; nothing else opens it. It is modal within Pinned: while it is open the Tiles are inert — no dragging, no removing — and closing it, either way, returns to Pinned rather than dismissing the Menu.
 _Avoid_: popup, dialog, modal, panel
 
 **Gear zone**:
-The Hub's bottom segment; releasing the Trigger there opens config.json in the default editor — the secondary, manual editing path.
+The Hub's bottom segment; releasing the Trigger there enters Pinned with no Popover open — the way in to rearranging and editing. Opening config.json by hand is the tray's job, not the Menu's.
 _Avoid_: settings button
+
+**Done button**:
+What the Gear zone becomes while Pinned: the same bottom segment of the Hub, now the way out. The way in and the way out share one place, so leaving is where the user last clicked to arrive.
+_Avoid_: close button, exit, OK
 
 ## Relationships
 
@@ -81,6 +89,11 @@ _Avoid_: settings button
 - The **Arc** and **Hub** both track **Hover**; neither decides what launches, they only preview it
 - Losing **Hover** (cursor back in the **Dead zone**) simply fades the **Arc** out and the **Hub** back to its idle dot — no separate "cancelled" state exists
 - Launching is never delayed by animation: the close animation plays while the **Item** is already starting
+- Dragging a **Tile** reorders the **Items**: the dragged one takes the target **Slot**'s place and the ones between it and its old place shift over — nothing is swapped
+- Adding, removing, or reordering an **Item** changes the **Slot** count or order, so every **Tile** moves to a new angle — the **Menu** is always evenly divided
+- Every change made while **Pinned** is saved the moment it happens, and what gets saved is what the **Menu** shows — the config file is a recording of the visible state, not a separate truth to reconcile with it
+- Removing an **Item** never touches the **Icon Library**: two Items can share one stored file, so the file outlives the Item that referenced it
+- A **Menu** with no **Slots** at all — no Items, **Dodaj slot** hidden — is a legal state, not a broken one: the **Scrim** and **Hub** still draw, and the **Gear zone** still works, so **Pinned** is always reachable and the user can never lock themselves out
 
 ## Example dialogue
 

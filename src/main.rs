@@ -11,6 +11,7 @@ mod icons;
 mod launch;
 mod logging;
 mod popover;
+mod present;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +24,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    GWL_EXSTYLE, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::w;
 use winit::application::ApplicationHandler;
@@ -307,10 +308,10 @@ impl App {
         }
         let Some(pinned) = &mut self.pinned else { return };
 
-        // ADR-0002: the window never resizes while the swapchain lives (the AMD
-        // driver resets on ResizeBuffers of a DComp swapchain), so the panel
-        // draws centered over the Menu, inside the existing window bounds. It
-        // expands out of the Tile it belongs to.
+        // The panel draws centered over the Menu, inside the existing window
+        // bounds, expanding out of the Tile it belongs to. ADR-0002 forced this
+        // (resizing a DComp swapchain reset the AMD driver); ADR-0007 removed
+        // the swapchain, so growing the window is merely unnecessary now.
         let slot = match edit {
             Some(i) => self.geo.slot_of_item(i),
             None => self.geo.meta_slot().unwrap_or(0),
@@ -669,18 +670,21 @@ impl ApplicationHandler<AppEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("sideQM")
             .with_decorations(false)
-            .with_transparent(true)
+            // No .with_transparent(true): that asks DWM for blur-behind, which
+            // the DirectComposition path needed. A layered window carries its
+            // own per-pixel alpha, and the two do not mix (ADR-0007).
             .with_resizable(false)
             .with_visible(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(PhysicalSize::new(size, size))
-            .with_skip_taskbar(true)
-            // DirectComposition presents under the GDI redirection bitmap; drop it
-            // or the swapchain is invisible.
-            .with_no_redirection_bitmap(true);
+            .with_skip_taskbar(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("window creation"));
         set_no_activate(&window, true);
-        self.gfx = Some(gfx::Gfx::new(window.clone(), &self.cfg, self.geo));
+        if let Some(hwnd) = hwnd_of(&window) {
+            self.gfx = Some(gfx::Gfx::new(hwnd, &self.cfg, self.geo));
+        } else {
+            log!("no HWND for the window; the menu cannot render");
+        }
         self.window = Some(window);
         self.request_item_icons();
     }
@@ -919,16 +923,24 @@ fn hwnd_of(window: &Window) -> Option<HWND> {
     Some(HWND(h.hwnd.get() as *mut _))
 }
 
-/// Toggle WS_EX_NOACTIVATE (always keeping WS_EX_TOOLWINDOW): on for the
-/// press-and-hold Menu (never steals focus), off while Pinned (the Popover
-/// needs keyboard focus).
+/// Toggle WS_EX_NOACTIVATE (always keeping WS_EX_TOOLWINDOW and WS_EX_LAYERED):
+/// on for the press-and-hold Menu (never steals focus), off while Pinned (the
+/// Popover needs keyboard focus).
+///
+/// WS_EX_LAYERED is what makes UpdateLayeredWindow legal, and it is OR'd in on
+/// every call rather than set once — clearing it would discard the window's
+/// contents and leave the Menu invisible until the next frame.
 fn set_no_activate(window: &Window, on: bool) {
     let Some(hwnd) = hwnd_of(window) else { return };
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let na = WS_EX_NOACTIVATE.0 as isize;
         let ex = if on { ex | na } else { ex & !na };
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW.0 as isize);
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            ex | WS_EX_TOOLWINDOW.0 as isize | WS_EX_LAYERED.0 as isize,
+        );
     }
 }
 

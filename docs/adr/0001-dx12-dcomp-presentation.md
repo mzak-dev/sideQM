@@ -1,5 +1,10 @@
 # DX12 with DirectComposition presentation instead of wgpu defaults
 
+> **Superseded by [ADR-0007](0007-cpu-raster-layered-window.md).** The renderer
+> no longer uses the GPU at all, so none of the below applies to the current
+> code. Kept for the driver behaviour it records, which is still true of this
+> machine.
+
 The Menu needs per-pixel window transparency. wgpu 30's default backend
 selection picks Vulkan, which on this machine's AMD driver dies with
 STATUS_ACCESS_VIOLATION ~2 seconds after the first present to a transparent

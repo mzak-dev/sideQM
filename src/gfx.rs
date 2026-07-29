@@ -1,23 +1,30 @@
-//! wgpu rendering: transparent surface, SDF shapes (scrim, tiles, hub, arc),
-//! icon quads, glyphon text (always-on tile labels, hub name/subtitle).
+//! CPU rendering: tiny-skia rasterizes the Menu into a premultiplied RGBA
+//! pixmap, cosmic-text shapes and rasterizes every string into it, and
+//! `present::Layered` hands the finished frame to DWM.
+//!
+//! ADR-0007: nothing in this module touches the GPU. What used to be an SDF
+//! shader over three primitive kinds is now three path builders, and what used
+//! to be a glyph atlas on the GPU is a per-glyph blit.
 
 use std::f32::consts::TAU;
-use std::sync::Arc;
 use std::time::Instant;
 
-use glyphon::{
-    Attrs, Buffer as TextBuffer, Cache as GlyphCache, Color as TextColor, Family, FontSystem,
-    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
-    Viewport,
+use cosmic_text::{
+    Attrs, Buffer as TextBuffer, Color as TextColor, Family, FontSystem, Metrics, Shaping,
+    SwashCache,
 };
-use wgpu::util::DeviceExt;
-use winit::window::Window;
+use tiny_skia::{
+    BlendMode, Color, FillRule, FilterQuality, LineCap, Paint, Path, PathBuilder, Pixmap,
+    PixmapPaint, PremultipliedColorU8, Rect, Stroke, StrokeDash, Transform,
+};
+use windows::Win32::Foundation::HWND;
 
 use crate::anim::{Animator, FrameModel};
 use crate::config::Config;
 use crate::geometry::MenuGeometry;
 use crate::icons;
 use crate::popover::{self, PopoverState};
+use crate::present::{self, Layered};
 
 /// Icon inset and tile corner radius, as ratios of tile half-extent, so they
 /// keep their proportions under a configurable tile size instead of drifting.
@@ -27,38 +34,16 @@ const TILE_CORNER_RATIO: f32 = 18.0 / 32.0;
 const ARC_OFFSET: f32 = 6.0;
 /// Arc half-width, as a fraction of one slot's angular width.
 const ARC_HALF_FRAC: f32 = 0.4;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ShapeInstance {
-    pos: [f32; 2],
-    half: [f32; 2],
-    corner: f32,
-    border: f32,
-    fill: [f32; 4],
-    border_color: [f32; 4],
-    /// 0 = rounded box, 1 = arc stroke, 2 = circle segment (Gear zone).
-    kind: f32,
-    /// Arc: pointing angle, radians, same atan2 convention as `slot_angle`.
-    /// Segment: chord y-offset from the shape center, px (+down).
-    angle_center: f32,
-    /// Arc: half angular width, radians.
-    angle_half: f32,
-    /// Box only: > 0 = dash count around the border (the meta/"Dodaj" tile).
-    dash: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TexInstance {
-    pos: [f32; 2],
-    half: [f32; 2],
-    alpha: f32,
-}
+/// Dash periods around the Dodaj tile's border.
+const DODAJ_DASHES: f32 = 10.0;
+/// Longest chord used when flattening a curve into line segments. Below half a
+/// pixel the difference stops being representable after anti-aliasing.
+const FLATTEN_CHORD: f32 = 1.2;
 
 struct Slot {
     label: String,
-    icon: Option<wgpu::BindGroup>,
+    /// Decoded icon, premultiplied and ready to blit.
+    icon: Option<Pixmap>,
     /// Fallback glyph when there's no icon: first letter, or "+" for the meta slot.
     letter: Option<TextBuffer>,
     /// Always-visible caption below the tile; shaped once, recolored per frame.
@@ -133,24 +118,15 @@ const POP_FIELD_PAD: f32 = 9.0;
 const TOGGLE_LABEL_PX: f32 = 11.0;
 
 pub struct Gfx {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface_cfg: wgpu::SurfaceConfiguration,
-    srgb: bool,
-
-    shape_pipeline: wgpu::RenderPipeline,
-    tex_pipeline: wgpu::RenderPipeline,
-    globals_buf: wgpu::Buffer,
-    globals_bind: wgpu::BindGroup,
-    icon_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    /// The frame under construction: premultiplied RGBA, window-sized.
+    pixmap: Pixmap,
+    /// None only if GDI refused the DIB; the Menu then renders to nothing
+    /// rather than taking the process down.
+    layered: Option<Layered>,
+    hwnd: HWND,
 
     font_system: FontSystem,
     swash: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    text_renderer: TextRenderer,
     /// Hub's main line: lowercased selected name, or "·" while idle.
     hub_label_buf: TextBuffer,
     /// Hub's subtitle, shown only while a slot is selected.
@@ -166,8 +142,8 @@ pub struct Gfx {
     done_buf: TextBuffer,
     /// Popover text, created lazily when a Popover opens.
     pop: Option<PopBufs>,
-    /// Popover icon-preview texture, when the current target yields one.
-    pop_icon: Option<wgpu::BindGroup>,
+    /// Popover icon preview, when the current target yields one.
+    pop_icon: Option<Pixmap>,
 
     slots: Vec<Slot>,
     /// The full config, one shape everywhere; visual values read straight off it.
@@ -196,235 +172,295 @@ fn caret_x(buf: &TextBuffer, caret: usize) -> f32 {
     end_x
 }
 
-impl Gfx {
-    pub fn new(window: Arc<Window>, cfg: &Config, geo: MenuGeometry) -> Gfx {
-        let size = window.inner_size();
-        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        // ponytail: DX12 hardcoded — wgpu 30's Vulkan path access-violates on this
-        // AMD driver ~2s after the first present to a transparent window
-        // (STATUS_ACCESS_VIOLATION, diagnosed 2026-07). Revisit if wgpu/driver update.
-        instance_desc.backends = match std::env::var("SIDEQM_BACKEND").as_deref() {
-            Ok("vulkan") => wgpu::Backends::VULKAN,
-            Ok("gl") => wgpu::Backends::GL,
-            _ => wgpu::Backends::DX12,
-        };
-        // DirectComposition presentation: the only DX12 path with per-pixel window alpha.
-        instance_desc.backend_options.dx12.presentation_system =
-            wgpu::Dx12SwapchainKind::DxgiFromVisual;
-        let instance = wgpu::Instance::new(instance_desc);
-        let surface = instance.create_surface(window).expect("create surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("no device");
+fn width_of(buf: &TextBuffer) -> f32 {
+    buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max)
+}
 
-        let caps = surface.get_capabilities(&adapter);
-        // Transparency needs a non-opaque alpha mode; prefer premultiplied.
-        let alpha_mode = [
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::PostMultiplied,
-            wgpu::CompositeAlphaMode::Inherit,
-        ]
-        .into_iter()
-        .find(|m| caps.alpha_modes.contains(m))
-        .unwrap_or_else(|| {
-            eprintln!(
-                "sideQM: no transparent alpha mode on {} ({:?}); menu will have an opaque backdrop",
-                adapter.get_info().name,
-                caps.alpha_modes
-            );
-            caps.alpha_modes[0]
-        });
-        eprintln!(
-            "sideQM: adapter {} / {:?}, alpha {:?}",
-            adapter.get_info().name,
-            adapter.get_info().backend,
-            alpha_mode
+// --- shapes -------------------------------------------------------------
+// Three path builders replacing the three SDF branches the shader used to
+// carry. Curves are flattened into line segments rather than approximated
+// with cubics: at these radii the chord error is far below the anti-aliased
+// coverage the rasterizer produces anyway.
+
+/// A rounded box. Corner radius equal to both half-extents makes a circle,
+/// which is how the Scrim, the Hub and the toggle knob get drawn.
+fn round_rect(cx: f32, cy: f32, hw: f32, hh: f32, corner: f32) -> Option<Path> {
+    let hw = hw.max(0.01);
+    let hh = hh.max(0.01);
+    let r = corner.clamp(0.0, hw.min(hh));
+    let (l, t, right, b) = (cx - hw, cy - hh, cx + hw, cy + hh);
+    let mut pb = PathBuilder::new();
+    if r <= 0.01 {
+        pb.push_rect(Rect::from_ltrb(l, t, right, b)?);
+        return pb.finish();
+    }
+    // 4/3 * (sqrt(2) - 1): the standard cubic approximation of a quarter
+    // circle, off by at most 0.02% of the radius.
+    const K: f32 = 0.552_284_75;
+    let k = r * K;
+    pb.move_to(l + r, t);
+    pb.line_to(right - r, t);
+    pb.cubic_to(right - r + k, t, right, t + r - k, right, t + r);
+    pb.line_to(right, b - r);
+    pb.cubic_to(right, b - r + k, right - r + k, b, right - r, b);
+    pb.line_to(l + r, b);
+    pb.cubic_to(l + r - k, b, l, b - r + k, l, b - r);
+    pb.line_to(l, t + r);
+    pb.cubic_to(l, t + r - k, l + r - k, t, l + r, t);
+    pb.close();
+    pb.finish()
+}
+
+/// The arc indicator's centerline, to be stroked with round caps — which is
+/// what the SDF got for free by clamping the angle.
+fn arc_path(cx: f32, cy: f32, r: f32, center: f32, half: f32) -> Option<Path> {
+    let sweep = (half * 2.0).abs();
+    let steps = ((sweep * r / FLATTEN_CHORD).ceil() as usize).clamp(2, 1024);
+    let mut pb = PathBuilder::new();
+    for i in 0..=steps {
+        let a = center - half + sweep * (i as f32 / steps as f32);
+        let (x, y) = (cx + a.cos() * r, cy + a.sin() * r);
+        if i == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    pb.finish()
+}
+
+/// A disc of radius `r` cut by a horizontal chord at `dy` below the center,
+/// keeping the part below the chord: the Gear zone and the Done button.
+fn segment_path(cx: f32, cy: f32, r: f32, dy: f32) -> Option<Path> {
+    if dy >= r {
+        return None; // the chord has slid past the disc; nothing is left
+    }
+    let half_w = (r * r - dy * dy).max(0.0).sqrt();
+    // Angles of the two chord intersections, in the same y-down convention the
+    // rest of the Menu uses. Sweeping between them passes through the bottom.
+    let a0 = dy.atan2(half_w);
+    let a1 = std::f32::consts::PI - a0;
+    let sweep = a1 - a0;
+    let steps = ((sweep * r / FLATTEN_CHORD).ceil() as usize).clamp(2, 1024);
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + half_w, cy + dy);
+    for i in 1..=steps {
+        let a = a0 + sweep * (i as f32 / steps as f32);
+        pb.line_to(cx + a.cos() * r, cy + a.sin() * r);
+    }
+    pb.close();
+    pb.finish()
+}
+
+fn paint_of(rgb: [f32; 3], alpha: f32) -> Paint<'static> {
+    let mut p = Paint::default();
+    p.anti_alias = true;
+    p.blend_mode = BlendMode::SourceOver;
+    p.set_color(
+        Color::from_rgba(
+            rgb[0].clamp(0.0, 1.0),
+            rgb[1].clamp(0.0, 1.0),
+            rgb[2].clamp(0.0, 1.0),
+            alpha.clamp(0.0, 1.0),
+        )
+        .unwrap_or(Color::TRANSPARENT),
+    );
+    p
+}
+
+/// Fill, then an inset border stroke. Every `kind 0` shape the old shader drew
+/// arrives here; the border is inset by half its width so it sits inside the
+/// silhouette exactly as the SDF's distance band did.
+#[allow(clippy::too_many_arguments)]
+fn box_shape(
+    dst: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    hw: f32,
+    hh: f32,
+    corner: f32,
+    fill: ([f32; 3], f32),
+    border: Option<(f32, [f32; 3], f32)>,
+    dashes: f32,
+) {
+    if fill.1 > 0.002
+        && let Some(path) = round_rect(cx, cy, hw, hh, corner)
+    {
+        dst.fill_path(
+            &path,
+            &paint_of(fill.0, fill.1),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
         );
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let srgb = format.is_srgb();
+    }
+    let Some((width, rgb, alpha)) = border else {
+        return;
+    };
+    if width <= 0.0 || alpha <= 0.002 {
+        return;
+    }
+    let inset = width / 2.0;
+    let (ihw, ihh) = (hw - inset, hh - inset);
+    let icorner = (corner - inset).max(0.0);
+    let Some(path) = round_rect(cx, cy, ihw, ihh, icorner) else {
+        return;
+    };
+    let mut stroke = Stroke {
+        width,
+        line_cap: LineCap::Butt,
+        ..Default::default()
+    };
+    if dashes > 0.5 {
+        // Arc-length dashes around the actual perimeter. The shader spaced
+        // these by angle instead, which bunched them up at the corners.
+        let perim = 4.0 * (ihw - icorner).max(0.0) + 4.0 * (ihh - icorner).max(0.0) + TAU * icorner;
+        let seg = perim / (dashes * 2.0);
+        if seg > 0.05 {
+            stroke.dash = StrokeDash::new(vec![seg, seg], 0.0);
+        }
+    }
+    dst.stroke_path(
+        &path,
+        &paint_of(rgb, alpha),
+        &stroke,
+        Transform::identity(),
+        None,
+    );
+}
 
-        let surface_cfg = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        surface.configure(&device, &surface_cfg);
+// --- text ---------------------------------------------------------------
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+/// Source-over one coverage sample into a premultiplied destination pixel.
+/// The only hand-written blending in the renderer — every shape goes through
+/// tiny-skia, but glyph coverage arrives one pixel at a time from swash.
+#[inline]
+fn blend_over(dst: &mut PremultipliedColorU8, sr: f32, sg: f32, sb: f32, sa: f32) {
+    let inv = 1.0 - sa;
+    let to_u8 = |v: f32| (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+    let a = to_u8(sa + (dst.alpha() as f32 / 255.0) * inv);
+    // Clamp each channel to alpha: rounding can otherwise push a component one
+    // step above it, which is not a representable premultiplied color.
+    let r = to_u8(sr + (dst.red() as f32 / 255.0) * inv).min(a);
+    let g = to_u8(sg + (dst.green() as f32 / 255.0) * inv).min(a);
+    let b = to_u8(sb + (dst.blue() as f32 / 255.0) * inv).min(a);
+    *dst = PremultipliedColorU8::from_rgba(r, g, b, a).unwrap_or(*dst);
+}
 
-        let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globals"),
-            contents: bytemuck::cast_slice(&[size.width as f32, size.height as f32, 0.0, 0.0]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globals"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let globals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buf.as_entire_binding(),
-            }],
-        });
+/// Rasterize one shaped buffer into the pixmap.
+///
+/// Positioning mirrors glyphon's exactly — `line_y` scaled and rounded on its
+/// own, everything else folded into the physical glyph — so every offset that
+/// `draw` tuned against the old renderer still lands on the same pixel.
+#[allow(clippy::too_many_arguments)]
+fn blit_text(
+    dst: &mut Pixmap,
+    fs: &mut FontSystem,
+    swash: &mut SwashCache,
+    buf: &TextBuffer,
+    left: f32,
+    top: f32,
+    scale: f32,
+    rgb: [f32; 3],
+    alpha: f32,
+    clip: Option<[i32; 4]>,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.004 {
+        return;
+    }
+    let (w, h) = (dst.width() as i32, dst.height() as i32);
+    let [cl, ct, cr, cb] = clip.unwrap_or([0, 0, w, h]);
+    let (cl, ct, cr, cb) = (cl.max(0), ct.max(0), cr.min(w), cb.min(h));
+    if cl >= cr || ct >= cb {
+        return;
+    }
+    let base = TextColor::rgb(
+        (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+    );
+    let stride = dst.width() as usize;
+    let pixels = dst.pixels_mut();
+    for run in buf.layout_runs() {
+        let line_y = (run.line_y * scale).round() as i32;
+        for glyph in run.glyphs {
+            let pg = glyph.physical((left, top), scale);
+            // swash hands back coverage in the alpha channel and leaves the
+            // requested alpha unapplied, so it is folded in here.
+            swash.with_pixels(fs, pg.cache_key, base, |gx, gy, c| {
+                let x = pg.x + gx;
+                let y = line_y + pg.y + gy;
+                if x < cl || x >= cr || y < ct || y >= cb {
+                    return;
+                }
+                let sa = (c.a() as f32 / 255.0) * alpha;
+                if sa <= 0.002 {
+                    return;
+                }
+                let idx = y as usize * stride + x as usize;
+                let Some(px) = pixels.get_mut(idx) else {
+                    return;
+                };
+                blend_over(
+                    px,
+                    (c.r() as f32 / 255.0) * sa,
+                    (c.g() as f32 / 255.0) * sa,
+                    (c.b() as f32 / 255.0) * sa,
+                    sa,
+                );
+            });
+        }
+    }
+}
 
-        let icon_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("icon"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+/// A decoded icon, premultiplied once here rather than on every blit.
+fn to_pixmap(icon: &icons::RgbaIcon) -> Option<Pixmap> {
+    let mut pm = Pixmap::new(icon.width, icon.height)?;
+    for (dst, src) in pm.pixels_mut().iter_mut().zip(icon.pixels.chunks_exact(4)) {
+        let a = src[3] as u32;
+        let m = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+        *dst = PremultipliedColorU8::from_rgba(m(src[0]), m(src[1]), m(src[2]), src[3])
+            .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+    }
+    Some(pm)
+}
+
+/// Draw a square icon centered on `pos` with half-extent `half`.
+fn draw_icon(dst: &mut Pixmap, icon: &Pixmap, pos: [f32; 2], half: f32, alpha: f32) {
+    if half <= 0.0 || alpha <= 0.004 || icon.width() == 0 {
+        return;
+    }
+    let scale = (half * 2.0) / icon.width() as f32;
+    dst.draw_pixmap(
+        0,
+        0,
+        icon.as_ref(),
+        &PixmapPaint {
+            opacity: alpha.clamp(0.0, 1.0),
+            quality: FilterQuality::Bilinear,
             ..Default::default()
-        });
+        },
+        Transform::from_row(scale, 0.0, 0.0, scale, pos[0] - half, pos[1] - half),
+        None,
+    );
+}
 
-        let premul_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-        let target = [Some(wgpu::ColorTargetState {
-            format,
-            blend: Some(premul_blend),
-            write_mask: wgpu::ColorWrites::ALL,
-        })];
-
-        let shape_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shapes"),
-            bind_group_layouts: &[Some(&globals_layout)],
-            immediate_size: 0,
-        });
-        let shape_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shapes"),
-            layout: Some(&shape_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shape"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<ShapeInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x2, 1 => Float32x2, 2 => Float32,
-                        3 => Float32, 4 => Float32x4, 5 => Float32x4,
-                        6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32,
-                    ],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shape"),
-                compilation_options: Default::default(),
-                targets: &target,
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let tex_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tex"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&icon_layout)],
-            immediate_size: 0,
-        });
-        let tex_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("tex"),
-            layout: Some(&tex_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_tex"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<TexInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_tex"),
-                compilation_options: Default::default(),
-                targets: &target,
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+impl Gfx {
+    /// `hwnd` must already carry `WS_EX_LAYERED` — see `main::set_no_activate`.
+    pub fn new(hwnd: HWND, cfg: &Config, geo: MenuGeometry) -> Gfx {
+        let size = geo.window_size().max(1);
+        let pixmap = Pixmap::new(size, size).expect("frame pixmap");
+        let layered = Layered::new(hwnd, size, size);
+        if layered.is_none() {
+            eprintln!("sideQM: could not create the layered surface; the menu will not draw");
+        }
 
         let mut font_system = FontSystem::new();
         let swash = SwashCache::new();
-        let glyph_cache = GlyphCache::new(&device);
-        let mut viewport = Viewport::new(&device, &glyph_cache);
-        viewport.update(
-            &queue,
-            Resolution {
-                width: size.width,
-                height: size.height,
-            },
-        );
-        let mut atlas = TextAtlas::new(&device, &queue, &glyph_cache, format);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         // Placeholder metrics: set_items (called at the end of this function)
-        // recreates both from the configured label_font_px and seeds the idle
-        // "." text — that value isn't known this early in construction.
+        // recreates every buffer from the configured label_font_px and seeds
+        // the idle "·" — that value isn't known this early in construction.
         let hub_label_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 16.9));
         let hub_sub_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
         let gear_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
@@ -433,22 +469,11 @@ impl Gfx {
         let done_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
 
         let mut gfx = Gfx {
-            surface,
-            device,
-            queue,
-            surface_cfg,
-            srgb,
-            shape_pipeline,
-            tex_pipeline,
-            globals_buf,
-            globals_bind,
-            icon_layout,
-            sampler,
+            pixmap,
+            layered,
+            hwnd,
             font_system,
             swash,
-            viewport,
-            atlas,
-            text_renderer,
             hub_label_buf,
             hub_sub_buf,
             gear_buf,
@@ -601,12 +626,11 @@ impl Gfx {
         self.slots = slots;
     }
 
-    /// A decode finished: upload it and let the Tile stop drawing its letter.
-    /// Called from the event loop, which owns the Device and Queue.
+    /// A decode finished: convert it and let the Tile stop drawing its letter.
     pub fn set_slot_icon(&mut self, k: usize, icon: &icons::RgbaIcon) {
-        let bind = self.upload_icon(icon);
+        let pm = to_pixmap(icon);
         if let Some(slot) = self.slots.get_mut(k) {
-            slot.icon = Some(bind);
+            slot.icon = pm;
         }
     }
 
@@ -676,15 +700,15 @@ impl Gfx {
         self.animator.reorder_slots(from, to);
     }
 
-    /// Icon preview for the Popover's current target: a texture when one has
+    /// Icon preview for the Popover's current target: a pixmap when one has
     /// been decoded, else a fallback letter.
     pub fn set_popover_icon(&mut self, icon: Option<&icons::RgbaIcon>, fallback: char) {
-        self.pop_icon = icon.map(|i| self.upload_icon(i));
+        self.pop_icon = icon.and_then(to_pixmap);
         self.set_popover_fallback(fallback);
     }
 
     /// Just the letter — the name field changed but the icon didn't, so there
-    /// is no reason to re-upload the texture.
+    /// is no reason to rebuild the pixmap.
     pub fn set_popover_fallback(&mut self, fallback: char) {
         if let Some(pop) = &mut self.pop {
             let ch: String = fallback.to_uppercase().collect();
@@ -762,6 +786,12 @@ impl Gfx {
         }
 
         self.draw(&frame, view);
+        if let Some(layered) = &mut self.layered {
+            layered.present(self.pixmap.data());
+        }
+        // Frame pacing: block until the compositor is ready for the next one,
+        // or the redraw loop would spin as fast as the CPU can rasterize.
+        present::wait_for_vblank();
         Tick {
             request_frame: true,
             just_closed: false,
@@ -784,79 +814,23 @@ impl Gfx {
         out
     }
 
-    fn upload_icon(&self, icon: &icons::RgbaIcon) -> wgpu::BindGroup {
-        let format = if self.srgb {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
-        let texture = self.device.create_texture_with_data(
-            &self.queue,
-            &wgpu::TextureDescriptor {
-                label: Some("icon"),
-                size: wgpu::Extent3d {
-                    width: icon.width,
-                    height: icon.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &icon.pixels,
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("icon"),
-            layout: &self.icon_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        })
-    }
-
+    /// The window changed size. Legal now that no swapchain is involved —
+    /// ADR-0002's ban died with the DirectComposition path.
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.surface_cfg.width = width.max(1);
-        self.surface_cfg.height = height.max(1);
-        self.surface.configure(&self.device, &self.surface_cfg);
-        self.queue.write_buffer(
-            &self.globals_buf,
-            0,
-            bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
-        );
-        self.viewport
-            .update(&self.queue, Resolution { width, height });
-    }
-
-    /// sRGB component -> linear, when the surface format demands linear input.
-    fn col(&self, c: [f32; 3], a: f32) -> [f32; 4] {
-        if self.srgb {
-            let f = |v: f32| {
-                if v <= 0.04045 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            [f(c[0]), f(c[1]), f(c[2]), a]
-        } else {
-            [c[0], c[1], c[2], a]
+        let (w, h) = (width.max(1), height.max(1));
+        if self.pixmap.width() == w && self.pixmap.height() == h {
+            return;
         }
+        match Pixmap::new(w, h) {
+            Some(pm) => self.pixmap = pm,
+            None => return,
+        }
+        self.layered = Layered::new(self.hwnd, w, h);
     }
 
     fn draw(&mut self, frame: &FrameModel, view: &MenuView) {
-        let center = self.surface_cfg.width as f32 / 2.0;
+        self.pixmap.fill(Color::TRANSPARENT);
+        let center = self.pixmap.width() as f32 / 2.0;
         let hover = frame.hovered;
         // Popover expand progress; the meta Tile morphs into the panel, so it
         // stops drawing as itself the moment the popover exists.
@@ -874,14 +848,6 @@ impl Gfx {
         let idle_text = [0.490, 0.522, 0.565];
         let hub_dot = [0.361, 0.396, 0.439];
         let white = [1.0, 1.0, 1.0];
-        let rgba = |c: [f32; 3], a: f32| {
-            TextColor::rgba(
-                (c[0] * 255.0) as u8,
-                (c[1] * 255.0) as u8,
-                (c[2] * 255.0) as u8,
-                (a * 255.0) as u8,
-            )
-        };
 
         let tile_half = self.geo.tile_half();
         let tile_corner = tile_half * TILE_CORNER_RATIO;
@@ -902,10 +868,7 @@ impl Gfx {
         // Per-slot animated values: (position, scale, alpha). Tiles sit at
         // rest_r on their sprung angle — except the one being dragged, which
         // rides the cursor.
-        let dragged_slot = view
-            .drag
-            .as_ref()
-            .map(|d| self.geo.slot_of_item(d.from));
+        let dragged_slot = view.drag.as_ref().map(|d| self.geo.slot_of_item(d.from));
         let tiles: Vec<([f32; 2], f32, f32)> = frame
             .slots
             .iter()
@@ -923,45 +886,50 @@ impl Gfx {
             .collect();
 
         // --- shapes: scrim, hub, tiles, arc ---
+        // Emission order is the old vertex buffer's order, which is what keeps
+        // the alpha compositing identical.
         let scrim_scale = 0.85 + 0.15 * frame.scrim.max(0.0);
         let scrim_alpha = frame.scrim.clamp(0.0, 1.0);
-        let mut shapes = vec![
-            ShapeInstance {
-                pos: [center, center],
-                half: [scrim_r * scrim_scale, scrim_r * scrim_scale],
-                corner: scrim_r * scrim_scale,
-                border: 1.2,
-                fill: self.col(scrim_bg, opacity * scrim_alpha),
-                border_color: self.col(white, 0.06 * scrim_alpha),
-                ..Default::default()
-            },
-            ShapeInstance {
-                pos: [center, center],
-                half: [hub_r, hub_r],
-                corner: hub_r,
-                border: 1.2,
-                fill: self.col(hub_bg, scrim_alpha),
-                border_color: self.col(
-                    if hover.is_some() { accent } else { white },
-                    (if hover.is_some() { 0.45 } else { 0.10 }) * scrim_alpha,
-                ),
-                ..Default::default()
-            },
-        ];
+        let scrim_hr = scrim_r * scrim_scale;
+        box_shape(
+            &mut self.pixmap,
+            center,
+            center,
+            scrim_hr,
+            scrim_hr,
+            scrim_hr,
+            (scrim_bg, opacity * scrim_alpha),
+            Some((1.2, white, 0.06 * scrim_alpha)),
+            0.0,
+        );
+        box_shape(
+            &mut self.pixmap,
+            center,
+            center,
+            hub_r,
+            hub_r,
+            hub_r,
+            (hub_bg, scrim_alpha),
+            Some((
+                1.2,
+                if hover.is_some() { accent } else { white },
+                (if hover.is_some() { 0.45 } else { 0.10 }) * scrim_alpha,
+            )),
+            0.0,
+        );
         // Gear zone: the Hub's bottom segment; release there enters Pinned.
         // Once Pinned, the Hub belongs to the toggle instead.
-        if !view.editing {
-            shapes.push(ShapeInstance {
-                pos: [center, center],
-                half: [hub_r, hub_r],
-                fill: self.col(
-                    if view.gear_hover { accent } else { white },
-                    (if view.gear_hover { 0.14 } else { 0.05 }) * scrim_alpha,
-                ),
-                kind: 2.0,
-                angle_center: self.geo.gear_cut_dy(),
-                ..Default::default()
-            });
+        if !view.editing
+            && let Some(path) = segment_path(center, center, hub_r, self.geo.gear_cut_dy())
+        {
+            let a = (if view.gear_hover { 0.14 } else { 0.05 }) * scrim_alpha;
+            self.pixmap.fill_path(
+                &path,
+                &paint_of(if view.gear_hover { accent } else { white }, a),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
         for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
             if scale < 0.01 || alpha < 0.01 || (self.slots[k].is_meta && pop_active) {
@@ -973,17 +941,23 @@ impl Gfx {
             } else {
                 (white, 0.06, white, 0.12)
             };
-            shapes.push(ShapeInstance {
-                pos,
-                half: [tile_half * scale, tile_half * scale],
-                corner: tile_corner * scale,
-                border: 1.1,
-                fill: self.col(fill_c, fill_a * alpha),
-                border_color: self.col(border_c, border_a * alpha),
-                dash: if self.slots[k].is_meta { 10.0 } else { 0.0 },
-                ..Default::default()
-            });
+            box_shape(
+                &mut self.pixmap,
+                pos[0],
+                pos[1],
+                tile_half * scale,
+                tile_half * scale,
+                tile_corner * scale,
+                (fill_c, fill_a * alpha),
+                Some((1.1, border_c, border_a * alpha)),
+                if self.slots[k].is_meta {
+                    DODAJ_DASHES
+                } else {
+                    0.0
+                },
+            );
         }
+
         // --- Pinned chrome: a remove control per Item Tile, and the Dodaj
         // slot's toggle in the Hub. Both are inert while a Popover is open,
         // and drawing them then would only compete with the panel. ---
@@ -995,141 +969,164 @@ impl Gfx {
                     continue;
                 }
                 let hovered = view.hover_remove == Some(k);
-                shapes.push(ShapeInstance {
-                    pos: [
-                        pos[0] + tile_half * 0.85 * scale,
-                        pos[1] - tile_half * 0.85 * scale,
-                    ],
-                    half: [remove_r, remove_r],
-                    corner: remove_r,
-                    border: 1.1,
-                    fill: self.col(if hovered { danger } else { hub_bg }, 0.95 * alpha),
-                    border_color: self.col(if hovered { danger } else { white }, 0.35 * alpha),
-                    ..Default::default()
-                });
+                box_shape(
+                    &mut self.pixmap,
+                    pos[0] + tile_half * 0.85 * scale,
+                    pos[1] - tile_half * 0.85 * scale,
+                    remove_r,
+                    remove_r,
+                    remove_r,
+                    (if hovered { danger } else { hub_bg }, 0.95 * alpha),
+                    Some((1.1, if hovered { danger } else { white }, 0.35 * alpha)),
+                    0.0,
+                );
             }
             // Toggle: track + knob, the knob sliding to the "on" end when the
             // Dodaj slot is hidden.
-            let (track_w, track_h) = (30.0, 16.0);
+            let (track_w, track_h) = (30.0f32, 16.0f32);
             let track_cy = center + 9.0;
             let on = view.add_hidden;
-            shapes.push(ShapeInstance {
-                pos: [center, track_cy],
-                half: [track_w / 2.0, track_h / 2.0],
-                corner: track_h / 2.0,
-                border: 1.1,
-                fill: self.col(
+            box_shape(
+                &mut self.pixmap,
+                center,
+                track_cy,
+                track_w / 2.0,
+                track_h / 2.0,
+                track_h / 2.0,
+                (
                     if on { accent } else { white },
                     (if on { 0.75 } else { 0.08 }) * scrim_alpha,
                 ),
-                border_color: self.col(
+                Some((
+                    1.1,
                     if view.hover_toggle { accent } else { white },
                     (if view.hover_toggle { 0.7 } else { 0.18 }) * scrim_alpha,
-                ),
-                ..Default::default()
-            });
+                )),
+                0.0,
+            );
             let knob_r = track_h / 2.0 - 2.5;
-            shapes.push(ShapeInstance {
-                pos: [
-                    center + if on { track_w / 4.0 } else { -track_w / 4.0 },
-                    track_cy,
-                ],
-                half: [knob_r, knob_r],
-                corner: knob_r,
-                fill: self.col(if on { hub_bg } else { white }, 0.9 * scrim_alpha),
-                ..Default::default()
-            });
+            box_shape(
+                &mut self.pixmap,
+                center + if on { track_w / 4.0 } else { -track_w / 4.0 },
+                track_cy,
+                knob_r,
+                knob_r,
+                knob_r,
+                (if on { hub_bg } else { white }, 0.9 * scrim_alpha),
+                None,
+                0.0,
+            );
             // Done: the way out, in the same segment the Gear zone (the way in)
             // occupies outside Pinned.
-            shapes.push(ShapeInstance {
-                pos: [center, center],
-                half: [hub_r, hub_r],
-                fill: self.col(
-                    if view.hover_done { accent } else { white },
-                    (if view.hover_done { 0.18 } else { 0.06 }) * scrim_alpha,
-                ),
-                kind: 2.0,
-                angle_center: self.geo.done_cut_dy(),
-                ..Default::default()
-            });
+            if let Some(path) = segment_path(center, center, hub_r, self.geo.done_cut_dy()) {
+                let a = (if view.hover_done { 0.18 } else { 0.06 }) * scrim_alpha;
+                self.pixmap.fill_path(
+                    &path,
+                    &paint_of(if view.hover_done { accent } else { white }, a),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
 
         if let Some((arc_angle, arc_alpha)) = frame.arc {
-            shapes.push(ShapeInstance {
-                pos: [center, center],
-                half: [scrim_r + ARC_OFFSET, scrim_r + ARC_OFFSET],
-                border: 1.75, // half of the spec's 3.5px stroke
-                fill: self.col(accent, arc_alpha),
-                kind: 1.0,
-                angle_center: arc_angle,
-                angle_half: ARC_HALF_FRAC * (TAU / n as f32),
-                ..Default::default()
-            });
+            let r = scrim_r + ARC_OFFSET;
+            let half = ARC_HALF_FRAC * (TAU / n as f32);
+            if let Some(path) = arc_path(center, center, r, arc_angle, half) {
+                // border 1.75 was half of the spec's 3.5px stroke; a centered
+                // stroke wants the whole width, and round caps reproduce what
+                // clamping the SDF's angle used to give for free.
+                let stroke = Stroke {
+                    width: 3.5,
+                    line_cap: LineCap::Round,
+                    ..Default::default()
+                };
+                self.pixmap.stroke_path(
+                    &path,
+                    &paint_of(accent, arc_alpha),
+                    &stroke,
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
 
         // --- Popover: panel morphing out of the Dodaj Tile + form widgets ---
         // Content fades in over the last stretch of the expansion.
         let pop_content_a = ((pop_p - 0.6) / 0.4).clamp(0.0, 1.0) * scrim_alpha;
-        let to_win = |r: &popover::Rect| [center + r.center[0], center + r.center[1]];
         if pop_active {
             let ps = view.popover.unwrap();
             let lp = |a: f32, b: f32| a + (b - a) * pop_p;
             let panel = ps.layout.panel;
-            shapes.push(ShapeInstance {
-                pos: [
-                    center + lp(ps.origin[0], panel.center[0]),
-                    center + lp(ps.origin[1], panel.center[1]),
-                ],
-                half: [lp(tile_half, panel.half[0]), lp(tile_half, panel.half[1])],
-                corner: lp(tile_corner, 12.0),
-                border: 1.1,
-                fill: self.col(hub_bg, 0.97 * scrim_alpha),
-                border_color: self.col(white, 0.10 * scrim_alpha),
-                ..Default::default()
-            });
+            box_shape(
+                &mut self.pixmap,
+                center + lp(ps.origin[0], panel.center[0]),
+                center + lp(ps.origin[1], panel.center[1]),
+                lp(tile_half, panel.half[0]),
+                lp(tile_half, panel.half[1]),
+                lp(tile_corner, 12.0),
+                (hub_bg, 0.97 * scrim_alpha),
+                Some((1.1, white, 0.10 * scrim_alpha)),
+                0.0,
+            );
             if pop_content_a > 0.01 {
-                let field = |r: &popover::Rect, focused: bool| ShapeInstance {
-                    pos: to_win(r),
-                    half: r.half,
-                    corner: 8.0,
-                    border: 1.1,
-                    fill: self.col(white, 0.05 * pop_content_a),
-                    border_color: self.col(
-                        if focused { accent } else { white },
-                        (if focused { 0.85 } else { 0.12 }) * pop_content_a,
-                    ),
-                    ..Default::default()
-                };
                 use popover::Element as El;
-                shapes.push(field(&ps.layout.name_field, ps.focus == El::NameField));
-                shapes.push(field(&ps.layout.target_field, ps.focus == El::TargetField));
-                let button = |r: &popover::Rect, hovered: bool| ShapeInstance {
-                    pos: to_win(r),
-                    half: r.half,
-                    corner: 8.0,
-                    border: 1.1,
-                    fill: self.col(white, (if hovered { 0.11 } else { 0.06 }) * pop_content_a),
-                    border_color: self.col(
-                        if hovered { accent } else { white },
-                        (if hovered { 0.55 } else { 0.12 }) * pop_content_a,
-                    ),
-                    ..Default::default()
+                let a = pop_content_a;
+                let mut field = |r: &popover::Rect, focused: bool| {
+                    box_shape(
+                        &mut self.pixmap,
+                        center + r.center[0],
+                        center + r.center[1],
+                        r.half[0],
+                        r.half[1],
+                        8.0,
+                        (white, 0.05 * a),
+                        Some((
+                            1.1,
+                            if focused { accent } else { white },
+                            (if focused { 0.85 } else { 0.12 }) * a,
+                        )),
+                        0.0,
+                    );
                 };
-                shapes.push(button(&ps.layout.browse_btn, ps.hover == Some(El::Browse)));
-                shapes.push(button(&ps.layout.icon_btn, ps.hover == Some(El::IconBtn)));
-                shapes.push(button(&ps.layout.cancel_btn, ps.hover == Some(El::Cancel)));
+                field(&ps.layout.name_field, ps.focus == El::NameField);
+                field(&ps.layout.target_field, ps.focus == El::TargetField);
+                let mut button = |r: &popover::Rect, hovered: bool| {
+                    box_shape(
+                        &mut self.pixmap,
+                        center + r.center[0],
+                        center + r.center[1],
+                        r.half[0],
+                        r.half[1],
+                        8.0,
+                        (white, (if hovered { 0.11 } else { 0.06 }) * a),
+                        Some((
+                            1.1,
+                            if hovered { accent } else { white },
+                            (if hovered { 0.55 } else { 0.12 }) * a,
+                        )),
+                        0.0,
+                    );
+                };
+                button(&ps.layout.browse_btn, ps.hover == Some(El::Browse));
+                button(&ps.layout.icon_btn, ps.hover == Some(El::IconBtn));
+                button(&ps.layout.cancel_btn, ps.hover == Some(El::Cancel));
                 // Commit: accent when valid, muted when the target is empty.
                 let valid = ps.valid();
-                shapes.push(ShapeInstance {
-                    pos: to_win(&ps.layout.commit_btn),
-                    half: ps.layout.commit_btn.half,
-                    corner: 8.0,
-                    border: 1.1,
-                    fill: self.col(
+                box_shape(
+                    &mut self.pixmap,
+                    center + ps.layout.commit_btn.center[0],
+                    center + ps.layout.commit_btn.center[1],
+                    ps.layout.commit_btn.half[0],
+                    ps.layout.commit_btn.half[1],
+                    8.0,
+                    (
                         if valid { accent } else { white },
-                        (if valid { 0.9 } else { 0.05 }) * pop_content_a,
+                        (if valid { 0.9 } else { 0.05 }) * a,
                     ),
-                    border_color: self.col(
+                    Some((
+                        1.1,
                         accent,
                         (if valid {
                             1.0
@@ -1137,20 +1134,22 @@ impl Gfx {
                             0.35
                         } else {
                             0.0
-                        }) * pop_content_a,
-                    ),
-                    ..Default::default()
-                });
+                        }) * a,
+                    )),
+                    0.0,
+                );
                 // Icon preview well.
-                shapes.push(ShapeInstance {
-                    pos: to_win(&ps.layout.icon_preview),
-                    half: ps.layout.icon_preview.half,
-                    corner: 8.0,
-                    border: 1.1,
-                    fill: self.col(white, 0.05 * pop_content_a),
-                    border_color: self.col(white, 0.10 * pop_content_a),
-                    ..Default::default()
-                });
+                box_shape(
+                    &mut self.pixmap,
+                    center + ps.layout.icon_preview.center[0],
+                    center + ps.layout.icon_preview.center[1],
+                    ps.layout.icon_preview.half[0],
+                    ps.layout.icon_preview.half[1],
+                    8.0,
+                    (white, 0.05 * a),
+                    Some((1.1, white, 0.10 * a)),
+                    0.0,
+                );
                 // Caret in the focused field, 1s blink cycle.
                 let blink_on = self.epoch.elapsed().as_millis() % 1000 < 500;
                 if blink_on && let Some(pop) = &self.pop {
@@ -1163,218 +1162,192 @@ impl Gfx {
                     let inner_w = rect.half[0] * 2.0 - 2.0 * POP_FIELD_PAD;
                     let scroll = (inner_w - 2.0 - cx).min(0.0);
                     let x = center + rect.left() + POP_FIELD_PAD + scroll + cx;
-                    shapes.push(ShapeInstance {
-                        pos: [x, center + rect.center[1]],
-                        half: [0.75, rect.half[1] - 7.0],
-                        fill: self.col(accent, 0.95 * pop_content_a),
-                        ..Default::default()
-                    });
+                    box_shape(
+                        &mut self.pixmap,
+                        x,
+                        center + rect.center[1],
+                        0.75,
+                        rect.half[1] - 7.0,
+                        0.0,
+                        (accent, 0.95 * a),
+                        None,
+                        0.0,
+                    );
                 }
             }
         }
 
-        let shape_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("shapes"),
-                contents: bytemuck::cast_slice(&shapes),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        // --- icon quads ---
-        let mut tex_instances: Vec<TexInstance> = tiles
-            .iter()
-            .map(|&(pos, scale, alpha)| TexInstance {
+        // --- icons ---
+        for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
+            let Some(icon) = self.slots.get(k).and_then(|s| s.icon.as_ref()) else {
+                continue;
+            };
+            draw_icon(
+                &mut self.pixmap,
+                icon,
                 pos,
-                half: [
-                    (tile_half - icon_inset) * scale,
-                    (tile_half - icon_inset) * scale,
-                ],
+                (tile_half - icon_inset) * scale,
                 alpha,
-            })
-            .collect();
-        // Popover icon preview rides at the end, drawn with its own bind group.
-        let pop_icon_instance = (pop_active && pop_content_a > 0.01 && self.pop_icon.is_some())
-            .then(|| {
-                let r = &view.popover.unwrap().layout.icon_preview;
-                tex_instances.push(TexInstance {
-                    pos: to_win(r),
-                    half: [r.half[0] - 6.0, r.half[1] - 6.0],
-                    alpha: pop_content_a,
-                });
-                tex_instances.len() - 1
-            });
-        let tex_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tex-instances"),
-                contents: bytemuck::cast_slice(&tex_instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            );
+        }
+        if pop_active
+            && pop_content_a > 0.01
+            && let Some(icon) = &self.pop_icon
+        {
+            let r = &view.popover.unwrap().layout.icon_preview;
+            draw_icon(
+                &mut self.pixmap,
+                icon,
+                [center + r.center[0], center + r.center[1]],
+                r.half[0] - 6.0,
+                pop_content_a,
+            );
+        }
 
-        // --- text areas: fallback letters, always-on tile labels, hub text ---
-        let mut areas: Vec<TextArea> = Vec::new();
-        let full_bounds = TextBounds {
-            left: 0,
-            top: 0,
-            right: self.surface_cfg.width as i32,
-            bottom: self.surface_cfg.height as i32,
-        };
-        for (k, slot) in self.slots.iter().enumerate() {
+        // --- text: fallback letters, always-on tile labels, hub text ---
+        let glyph_px = self.geo.glyph_px();
+        for k in 0..self.slots.len() {
             let (pos, scale, alpha) = tiles[k];
-            if scale < 0.01 || alpha < 0.01 || (slot.is_meta && pop_active) {
+            if scale < 0.01 || alpha < 0.01 || (self.slots[k].is_meta && pop_active) {
                 continue;
             }
             // The letter is what a Tile shows until its icon has been decoded,
             // and what it keeps forever if there is no icon to be had.
-            if slot.icon.is_none()
-                && let Some(letter) = &slot.letter
+            if self.slots[k].icon.is_none()
+                && let Some(letter) = &self.slots[k].letter
             {
                 // Positioning ratios tuned against geo.glyph_px(), the same
                 // size set_items shaped this buffer with.
-                let glyph_px = self.geo.glyph_px();
-                areas.push(TextArea {
-                    buffer: letter,
-                    left: pos[0] - glyph_px * 0.32 * scale,
-                    top: pos[1] - glyph_px * 0.5 * scale,
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    letter,
+                    pos[0] - glyph_px * 0.32 * scale,
+                    pos[1] - glyph_px * 0.5 * scale,
                     scale,
-                    bounds: full_bounds,
-                    default_color: TextColor::rgba(26, 26, 26, (alpha * 255.0) as u8),
-                    custom_glyphs: &[],
-                });
+                    [0.102, 0.102, 0.102], // #1A1A1A
+                    alpha,
+                    None,
+                );
             }
             let hovered = hover == Some(k);
-            let label_w = slot
-                .label_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
-            areas.push(TextArea {
-                buffer: &slot.label_buf,
-                left: pos[0] - label_w / 2.0,
-                top: pos[1] + tile_half * scale + 8.0,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(if hovered { accent } else { idle_text }, alpha),
-                custom_glyphs: &[],
-            });
+            let label_w = width_of(&self.slots[k].label_buf);
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.slots[k].label_buf,
+                pos[0] - label_w / 2.0,
+                pos[1] + tile_half * scale + 8.0,
+                1.0,
+                if hovered { accent } else { idle_text },
+                alpha,
+                None,
+            );
         }
         // The Hub's idle dot / selected name, and the gear glyph, belong to the
         // press-and-hold Menu. While Pinned the Hub is the toggle's.
         if !view.editing {
-            let name_w = self
-                .hub_label_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
-            areas.push(TextArea {
-                buffer: &self.hub_label_buf,
-                left: center - name_w / 2.0,
-                top: center - label_font_px * 0.7,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(if hover.is_some() { accent } else { hub_dot }, scrim_alpha),
-                custom_glyphs: &[],
-            });
+            let name_w = width_of(&self.hub_label_buf);
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.hub_label_buf,
+                center - name_w / 2.0,
+                center - label_font_px * 0.7,
+                1.0,
+                if hover.is_some() { accent } else { hub_dot },
+                scrim_alpha,
+                None,
+            );
         }
         if hover.is_some() && !view.editing {
-            let sub_w = self
-                .hub_sub_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
-            areas.push(TextArea {
-                buffer: &self.hub_sub_buf,
-                left: center - sub_w / 2.0,
-                top: center + label_font_px * 0.55,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(idle_text, scrim_alpha),
-                custom_glyphs: &[],
-            });
+            let sub_w = width_of(&self.hub_sub_buf);
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.hub_sub_buf,
+                center - sub_w / 2.0,
+                center + label_font_px * 0.55,
+                1.0,
+                idle_text,
+                scrim_alpha,
+                None,
+            );
         }
         // Gear glyph, centered in the Hub's bottom segment.
         if !view.editing {
-            let gear_w = self
-                .gear_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
+            let gear_w = width_of(&self.gear_buf);
             let gear_px = self.geo.hub_r() * 0.28;
             let seg_cy = center + (self.geo.gear_cut_dy() + hub_r) / 2.0;
-            areas.push(TextArea {
-                buffer: &self.gear_buf,
-                left: center - gear_w / 2.0,
-                top: seg_cy - gear_px * 0.62,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(if view.gear_hover { accent } else { hub_dot }, scrim_alpha),
-                custom_glyphs: &[],
-            });
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.gear_buf,
+                center - gear_w / 2.0,
+                seg_cy - gear_px * 0.62,
+                1.0,
+                if view.gear_hover { accent } else { hub_dot },
+                scrim_alpha,
+                None,
+            );
         } else if !pop_active {
             // Toggle caption, above the switch.
-            let w = self
-                .toggle_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
-            areas.push(TextArea {
-                buffer: &self.toggle_buf,
-                left: center - w / 2.0,
-                top: center - TOGGLE_LABEL_PX * 1.5,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(
-                    if view.hover_toggle { accent } else { idle_text },
-                    scrim_alpha,
-                ),
-                custom_glyphs: &[],
-            });
+            let w = width_of(&self.toggle_buf);
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.toggle_buf,
+                center - w / 2.0,
+                center - TOGGLE_LABEL_PX * 1.5,
+                1.0,
+                if view.hover_toggle { accent } else { idle_text },
+                scrim_alpha,
+                None,
+            );
             // Done caption, centered in the Hub's bottom segment.
-            let done_w = self
-                .done_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
+            let done_w = width_of(&self.done_buf);
             let seg_cy = center + (self.geo.done_cut_dy() + hub_r) / 2.0;
-            areas.push(TextArea {
-                buffer: &self.done_buf,
-                left: center - done_w / 2.0,
-                top: seg_cy - TOGGLE_LABEL_PX * 0.62,
-                scale: 1.0,
-                bounds: full_bounds,
-                default_color: rgba(
-                    if view.hover_done { accent } else { idle_text },
-                    scrim_alpha,
-                ),
-                custom_glyphs: &[],
-            });
+            blit_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.done_buf,
+                center - done_w / 2.0,
+                seg_cy - TOGGLE_LABEL_PX * 0.62,
+                1.0,
+                if view.hover_done { accent } else { idle_text },
+                scrim_alpha,
+                None,
+            );
             // One glyph buffer, drawn once per removable Tile.
-            let rm_w = self
-                .remove_buf
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0f32, f32::max);
+            let rm_w = width_of(&self.remove_buf);
             for (k, (pos, scale, alpha)) in tiles.iter().copied().enumerate() {
                 if self.slots.get(k).is_none_or(|s| s.is_meta) || scale < 0.01 || alpha < 0.01 {
                     continue;
                 }
-                areas.push(TextArea {
-                    buffer: &self.remove_buf,
-                    left: pos[0] + tile_half * 0.85 * scale - rm_w / 2.0,
-                    top: pos[1] - tile_half * 0.85 * scale - remove_r * 0.95,
-                    scale: 1.0,
-                    bounds: full_bounds,
-                    default_color: rgba(
-                        if view.hover_remove == Some(k) {
-                            white
-                        } else {
-                            idle_text
-                        },
-                        alpha,
-                    ),
-                    custom_glyphs: &[],
-                });
+                let color = if view.hover_remove == Some(k) {
+                    white
+                } else {
+                    idle_text
+                };
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    &self.remove_buf,
+                    pos[0] + tile_half * 0.85 * scale - rm_w / 2.0,
+                    pos[1] - tile_half * 0.85 * scale - remove_r * 0.95,
+                    1.0,
+                    color,
+                    alpha,
+                    None,
+                );
             }
         }
         // Popover text: labels, field contents (clipped + caret-scrolled),
@@ -1386,21 +1359,22 @@ impl Gfx {
             use popover::Element as El;
             let a = pop_content_a;
             let text_c = [0.92, 0.94, 0.96];
-            let width_of =
-                |buf: &TextBuffer| buf.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
             for (buf, rect) in [
                 (&pop.lbl_name, &ps.layout.name_field),
                 (&pop.lbl_target, &ps.layout.target_field),
             ] {
-                areas.push(TextArea {
-                    buffer: buf,
-                    left: center + rect.left() + 2.0,
-                    top: center + rect.top() - POP_LABEL_PX * 1.55,
-                    scale: 1.0,
-                    bounds: full_bounds,
-                    default_color: rgba(idle_text, a),
-                    custom_glyphs: &[],
-                });
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    buf,
+                    center + rect.left() + 2.0,
+                    center + rect.top() - POP_LABEL_PX * 1.55,
+                    1.0,
+                    idle_text,
+                    a,
+                    None,
+                );
             }
             for (buf, rect, caret, focused) in [
                 (
@@ -1422,20 +1396,26 @@ impl Gfx {
                 } else {
                     0.0
                 };
-                areas.push(TextArea {
-                    buffer: buf,
-                    left: center + rect.left() + POP_FIELD_PAD + scroll,
-                    top: center + rect.center[1] - POP_FIELD_PX * 0.62,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: (center + rect.left() + 3.0) as i32,
-                        top: (center + rect.top()) as i32,
-                        right: (center + rect.left() + rect.half[0] * 2.0 - 3.0) as i32,
-                        bottom: (center + rect.top() + rect.half[1] * 2.0) as i32,
-                    },
-                    default_color: rgba(text_c, a),
-                    custom_glyphs: &[],
-                });
+                // Clip to the field, so a long value scrolls under its border
+                // instead of spilling across the panel.
+                let clip = [
+                    (center + rect.left() + 3.0) as i32,
+                    (center + rect.top()) as i32,
+                    (center + rect.left() + rect.half[0] * 2.0 - 3.0) as i32,
+                    (center + rect.top() + rect.half[1] * 2.0) as i32,
+                ];
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    buf,
+                    center + rect.left() + POP_FIELD_PAD + scroll,
+                    center + rect.center[1] - POP_FIELD_PX * 0.62,
+                    1.0,
+                    text_c,
+                    a,
+                    Some(clip),
+                );
             }
             let valid = ps.valid();
             let buttons: [(&TextBuffer, &popover::Rect, [f32; 3]); 4] = [
@@ -1450,112 +1430,168 @@ impl Gfx {
                 ),
             ];
             for (buf, rect, color) in buttons {
-                areas.push(TextArea {
-                    buffer: buf,
-                    left: center + rect.center[0] - width_of(buf) / 2.0,
-                    top: center + rect.center[1] - POP_BTN_PX * 0.62,
-                    scale: 1.0,
-                    bounds: full_bounds,
-                    default_color: rgba(color, a),
-                    custom_glyphs: &[],
-                });
+                let w = width_of(buf);
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    buf,
+                    center + rect.center[0] - w / 2.0,
+                    center + rect.center[1] - POP_BTN_PX * 0.62,
+                    1.0,
+                    color,
+                    a,
+                    None,
+                );
             }
             if self.pop_icon.is_none() {
                 let rect = &ps.layout.icon_preview;
-                areas.push(TextArea {
-                    buffer: &pop.fallback,
-                    left: center + rect.center[0] - width_of(&pop.fallback) / 2.0,
-                    top: center + rect.center[1] - POP_FALLBACK_PX * 0.55,
-                    scale: 1.0,
-                    bounds: full_bounds,
-                    default_color: rgba(idle_text, a),
-                    custom_glyphs: &[],
-                });
+                let w = width_of(&pop.fallback);
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    &pop.fallback,
+                    center + rect.center[0] - w / 2.0,
+                    center + rect.center[1] - POP_FALLBACK_PX * 0.55,
+                    1.0,
+                    idle_text,
+                    a,
+                    None,
+                );
             }
         }
-        if let Err(e) = self.text_renderer.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            areas,
-            &mut self.swash,
-        ) {
-            eprintln!("sideQM: text prepare failed: {e}");
-        }
+    }
+}
 
-        // --- pass ---
-        use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = match self.surface.get_current_texture() {
-            Cst::Success(f) | Cst::Suboptimal(f) => f,
-            Cst::Outdated | Cst::Lost => {
-                self.surface.configure(&self.device, &self.surface_cfg);
-                match self.surface.get_current_texture() {
-                    Cst::Success(f) | Cst::Suboptimal(f) => f,
-                    other => {
-                        eprintln!("sideQM: surface unavailable after reconfigure: {other:?}");
-                        return;
-                    }
-                }
-            }
-            other => {
-                eprintln!("sideQM: skipping frame: {other:?}");
-                return;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three path builders replace the shader's three SDF branches; these
+    /// pin down the shapes they are supposed to produce.
+    #[test]
+    fn round_rect_spans_its_extents_and_degrades_to_a_circle() {
+        let p = round_rect(100.0, 50.0, 20.0, 10.0, 4.0).expect("rounded rect");
+        let b = p.bounds();
+        assert!((b.left() - 80.0).abs() < 0.01, "{b:?}");
+        assert!((b.right() - 120.0).abs() < 0.01, "{b:?}");
+        assert!((b.top() - 40.0).abs() < 0.01, "{b:?}");
+        assert!((b.bottom() - 60.0).abs() < 0.01, "{b:?}");
+
+        // Corner radius is clamped to the smaller half-extent, so the Scrim's
+        // corner == half never produces a degenerate path.
+        let circle = round_rect(0.0, 0.0, 30.0, 30.0, 999.0).expect("circle");
+        let b = circle.bounds();
+        assert!(
+            (b.left() + 30.0).abs() < 0.01 && (b.right() - 30.0).abs() < 0.01,
+            "{b:?}"
+        );
+
+        // Zero radius is a plain rect, not an empty path.
+        assert!(round_rect(0.0, 0.0, 5.0, 5.0, 0.0).is_some());
+    }
+
+    #[test]
+    fn segment_keeps_the_part_below_the_chord() {
+        let r = 40.0;
+        let dy = 24.0;
+        let p = segment_path(0.0, 0.0, r, dy).expect("segment");
+        let b = p.bounds();
+        // Bottom reaches the disc, top stops at the chord.
+        assert!((b.bottom() - r).abs() < 0.5, "{b:?}");
+        assert!((b.top() - dy).abs() < 0.5, "{b:?}");
+        let half_w = (r * r - dy * dy).sqrt();
+        assert!((b.right() - half_w).abs() < 0.5, "{b:?}");
+
+        // A chord past the disc leaves nothing to draw rather than a bad path.
+        assert!(segment_path(0.0, 0.0, r, r + 1.0).is_none());
+    }
+
+    #[test]
+    fn arc_rides_its_radius_around_the_pointing_angle() {
+        let r = 100.0;
+        let p = arc_path(0.0, 0.0, r, 0.0, 0.3).expect("arc");
+        // Every flattened point sits on the circle, within the chord error.
+        for pt in p.points() {
+            let d = (pt.x * pt.x + pt.y * pt.y).sqrt();
+            assert!((d - r).abs() < 1.0, "point off the radius: {d}");
+        }
+        let b = p.bounds();
+        assert!(b.right() > 90.0, "arc should point along +x: {b:?}");
+    }
+
+    /// Popover fields scroll their text under the field border, so the clip
+    /// rect is the only thing keeping a long value from spilling across the
+    /// panel. glyphon used to enforce this with `TextBounds`.
+    #[test]
+    fn text_blit_respects_its_clip_rect() {
+        let mut fs = FontSystem::new();
+        let mut swash = SwashCache::new();
+        let mut buf = TextBuffer::new(&mut fs, Metrics::new(20.0, 26.0));
+        buf.set_text(
+            "MMMMMMMMMMMM",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(&mut fs, false);
+
+        let ink = |pm: &Pixmap, l: u32, r: u32| {
+            let w = pm.width() as usize;
+            let px = pm.pixels();
+            (0..pm.height() as usize)
+                .flat_map(|y| (l as usize..r as usize).map(move |x| y * w + x))
+                .filter(|&i| px[i].alpha() > 0)
+                .count()
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("menu"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.shape_pipeline);
-            pass.set_bind_group(0, &self.globals_bind, &[]);
-            pass.set_vertex_buffer(0, shape_buf.slice(..));
-            pass.draw(0..6, 0..shapes.len() as u32);
 
-            pass.set_pipeline(&self.tex_pipeline);
-            pass.set_vertex_buffer(0, tex_buf.slice(..));
-            for (k, slot) in self.slots.iter().enumerate() {
-                if let Some(bind) = &slot.icon {
-                    pass.set_bind_group(1, bind, &[]);
-                    pass.draw(0..6, k as u32..k as u32 + 1);
-                }
-            }
-            if let (Some(i), Some(bind)) = (pop_icon_instance, &self.pop_icon) {
-                pass.set_bind_group(1, bind, &[]);
-                pass.draw(0..6, i as u32..i as u32 + 1);
-            }
+        let mut full = Pixmap::new(240, 40).unwrap();
+        blit_text(
+            &mut full,
+            &mut fs,
+            &mut swash,
+            &buf,
+            5.0,
+            5.0,
+            1.0,
+            [1.0, 1.0, 1.0],
+            1.0,
+            None,
+        );
+        assert!(ink(&full, 0, 120) > 0, "no text rendered at all");
+        assert!(
+            ink(&full, 120, 240) > 0,
+            "the sample must be long enough to cross the clip edge"
+        );
 
-            if let Err(e) = self
-                .text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-            {
-                eprintln!("sideQM: text render failed: {e}");
-            }
-        }
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
-        self.atlas.trim();
+        let mut clipped = Pixmap::new(240, 40).unwrap();
+        blit_text(
+            &mut clipped,
+            &mut fs,
+            &mut swash,
+            &buf,
+            5.0,
+            5.0,
+            1.0,
+            [1.0, 1.0, 1.0],
+            1.0,
+            Some([0, 0, 120, 40]),
+        );
+        assert!(ink(&clipped, 0, 120) > 0, "clipping erased everything");
+        assert_eq!(ink(&clipped, 120, 240), 0, "text escaped the clip rect");
+    }
+
+    #[test]
+    fn blend_over_stays_a_valid_premultiplied_color() {
+        // Opaque white over transparent, then half-alpha black over that:
+        // the invariant that matters is channels <= alpha, which is what
+        // PremultipliedColorU8 refuses to represent otherwise.
+        let mut px = PremultipliedColorU8::TRANSPARENT;
+        blend_over(&mut px, 1.0, 1.0, 1.0, 1.0);
+        assert_eq!((px.red(), px.alpha()), (255, 255));
+        blend_over(&mut px, 0.0, 0.0, 0.0, 0.5);
+        assert!(px.red() <= px.alpha() && px.green() <= px.alpha() && px.blue() <= px.alpha());
+        assert_eq!(px.alpha(), 255);
     }
 }

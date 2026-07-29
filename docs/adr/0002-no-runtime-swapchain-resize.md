@@ -1,5 +1,10 @@
 # Never resize the swapchain at runtime; the Popover draws inside the fixed window
 
+> **Superseded by [ADR-0007](0007-cpu-raster-layered-window.md).** There is no
+> swapchain any more, so resizing is safe. The Popover still draws inside the
+> fixed window, but now because that layout works rather than because growing
+> the window would reset the driver.
+
 Opening the Popover used to grow the window (`request_inner_size`) so the panel
 could sit radially outside the Scrim — the only runtime resize in the app, and
 this machine's AMD driver resets on it (`ResizeBuffers` on a live

@@ -33,8 +33,10 @@ is the actual defect.
 The same delivery path carries decoded icons. Rasterizing an SVG or pulling a
 256px shell icon is slow enough to stutter the Menu's entrance, and the Popover
 re-extracted an icon on every keystroke. A single worker thread now does the
-decoding; the event loop only builds cache keys and uploads finished pixels
-(wgpu resources belong to the thread that owns the Device and Queue).
+decoding; the event loop only builds cache keys and converts finished pixels
+into the renderer's own format. That last step was once a hard constraint (GPU
+resources belonged to the thread owning the Device and Queue); since ADR-0007
+made the renderer CPU-side it is merely where the code happens to sit.
 
 Results are matched to Tiles by key, not by remembering which request asked for
 them — a config reload mid-decode leaves no Tile holding that key, so the result

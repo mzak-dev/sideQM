@@ -21,6 +21,13 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// Run key is a persistence pattern AV heuristics (Defender flagged this as
 /// Trojan:Win32/Bearfoos.A!ml on another machine) key off, even though it's
 /// legitimate here.
+///
+/// Idempotent: skips the write/delete when the key already matches the
+/// desired state, so a normal run (autostart unchanged) never touches the
+/// Run key at all. Called unconditionally on every launch and config
+/// reload, so without this check every single startup would open the Run
+/// key and attempt a write — its own separate persistence-behavior
+/// signature (Defender flagged that as Behavior:Win32/Persistence.A!ml).
 pub fn set_autostart(enable: bool) {
     unsafe {
         let mut key = HKEY::default();
@@ -30,7 +37,7 @@ pub fn set_autostart(enable: bool) {
             Some(0),
             None,
             REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
+            KEY_READ | KEY_WRITE,
             None,
             &mut key,
             None,
@@ -39,24 +46,41 @@ pub fn set_autostart(enable: bool) {
         {
             return;
         }
+
+        let mut buf = [0u16; 520];
+        let mut buf_len = (buf.len() * 2) as u32;
+        let existing = RegGetValueW(
+            key,
+            None,
+            w!("sideQM"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut buf_len),
+        )
+        .is_ok()
+        .then(|| String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(0)]));
+
         if enable {
             let Ok(exe) = std::env::current_exe() else {
                 let _ = RegCloseKey(key);
                 return;
             };
-            let mut value: Vec<u16> = exe.to_string_lossy().encode_utf16().collect();
-            value.push(0);
-            let byte_len = (value.len() * 2) as u32;
-            let _ = RegSetKeyValueW(
-                key,
-                None,
-                w!("sideQM"),
-                REG_SZ.0,
-                Some(value.as_ptr().cast()),
-                byte_len,
-            );
-        } else {
-            // Deleting a value that doesn't exist fails; that's fine, ignore it quietly.
+            let exe = exe.to_string_lossy().into_owned();
+            if existing.as_deref() != Some(exe.as_str()) {
+                let mut value: Vec<u16> = exe.encode_utf16().collect();
+                value.push(0);
+                let byte_len = (value.len() * 2) as u32;
+                let _ = RegSetKeyValueW(
+                    key,
+                    None,
+                    w!("sideQM"),
+                    REG_SZ.0,
+                    Some(value.as_ptr().cast()),
+                    byte_len,
+                );
+            }
+        } else if existing.is_some() {
             let _ = RegDeleteKeyValueW(key, None, w!("sideQM"));
         }
         let _ = RegCloseKey(key);

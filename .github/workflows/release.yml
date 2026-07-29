@@ -26,16 +26,32 @@ jobs:
     - name: Build release binary
       run: cargo build --release --verbose
     # ponytail: version lives in Cargo.toml, so a merge that bumps it publishes a release.
-    # Every merge still tests and builds - it is only this step that no-ops when the
-    # version is unchanged. No tagging step, no release-please.
+    # Every merge still tests and builds. If the version didn't change (release for it
+    # already exists), auto-bump the patch by 0.0.5, commit that back to master, and
+    # release under the new tag instead of no-oping - so every merge always ships.
     # target/release is mostly build cache (deps/, .fingerprint/, *.pdb) - ship only the exe.
-    - name: Publish release if Cargo.toml version is new
+    - name: Publish release, auto-bumping if version is unchanged
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        $tag = "v" + (Select-String '^version = "(.+)"' Cargo.toml).Matches[0].Groups[1].Value
+        $sha = "${{ github.sha }}"
+        $version = (Select-String '^version = "(.+)"' Cargo.toml).Matches[0].Groups[1].Value
+        $tag = "v$version"
         gh release view $tag *> $null
-        if ($LASTEXITCODE -eq 0) { "Release $tag already exists - nothing to do"; exit 0 }
+        if ($LASTEXITCODE -eq 0) {
+          $parts = $version.Split(".")
+          $parts[2] = [int]$parts[2] + 5
+          $version = $parts -join "."
+          $tag = "v$version"
+          (Get-Content Cargo.toml) -replace '^version = ".+"', "version = `"$version`"" | Set-Content Cargo.toml
+          cargo update -p sideqm --precise $version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Bump version to $tag [skip ci]"
+          git push
+          $sha = git rev-parse HEAD
+        }
         $zip = "sideqm-$tag-windows-x64.zip"
         Compress-Archive -Path target/release/sideqm.exe, README.md -DestinationPath $zip
-        gh release create $tag $zip target/release/sideqm.exe --target ${{ github.sha }} --generate-notes --title $tag
+        gh release create $tag $zip target/release/sideqm.exe --target $sha --generate-notes --title $tag

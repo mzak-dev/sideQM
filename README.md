@@ -101,11 +101,10 @@ release yet, publishes one with the built binary
 version bump in `Cargo.toml` — no tagging by hand.
 
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary (Menu, Trigger, Slot, Hover, Arc, ...)
-- [`docs/adr/`](docs/adr) — architecture decisions (e.g. why rendering is pinned to DX12)
+- [`docs/adr/`](docs/adr) — architecture decisions (e.g. why rendering is done on the CPU)
 
 Debug env vars: `SIDEQM_CONFIG_PATH` (point at a scratch config file),
-`SIDEQM_BACKEND` (`vulkan`/`gl` override), `SIDEQM_AUTOSHOW` (open the Menu
-without holding the Trigger).
+`SIDEQM_AUTOSHOW` (open the Menu without holding the Trigger).
 
 If an icon doesn't show up or a config edit seems ignored, check
 `%APPDATA%\sideQM\sideqm.log` — it records every icon that failed to load and

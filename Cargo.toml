@@ -4,18 +4,22 @@ version = "0.5.5"
 edition = "2024"
 
 [dependencies]
-bytemuck = { version = "1.25.1", features = ["derive"] }
-glyphon = "0.12.0"
+# ADR-0007: the renderer is CPU-side. cosmic-text shapes and rasterizes glyphs
+# (what glyphon used to drive on the GPU) and tiny-skia rasterizes the shapes
+# (what shader.wgsl used to). Both were already in the tree via resvg/glyphon.
+cosmic-text = "0.19.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "ico", "bmp", "gif"] }
-pollster = "1.0.1"
 # ponytail: no "text"/"system-fonts" — an icon SVG with live <text> renders
 # without it; enabling them loads the system font DB on every rasterize.
 resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+tiny-skia = "0.11.4"
 tray-icon = "0.24.1"
-wgpu = "30"
-windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+# Win32_Security is needed by CreateMutexW and RegCreateKeyExW (both take
+# SECURITY_ATTRIBUTES). It used to arrive for free through wgpu's own feature
+# selection; dropping wgpu made the dependency this crate always had explicit.
+windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 winit = "0.30.13"
 
 [build-dependencies]

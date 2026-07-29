@@ -42,8 +42,20 @@ The Menu's neutral backdrop circle (a faint fill, a barely-there border) that ev
 _Avoid_: ring, border, circle edge
 
 **Hub**:
-The circle at the Menu's center, and the Menu's one piece of chrome. Idle, it shows a dot; while a Slot is Hovered, it shows that Item's name and a "release to launch" subtitle; while Pinned with no Popover open, it shows the Dodaj slot's toggle — and there it is never drawn smaller than that toggle needs, however small the configured Hub is. A Popover, when open, covers it entirely.
+The circle at the Menu's center, and the Menu's one piece of chrome. Idle, it shows a dot; while a Slot is Hovered, it shows that Item's name and a "release to launch" subtitle — unless Now Playing is active, which overrides idle and Hovered alike; while Pinned with no Popover open, it shows the Dodaj slot's toggle regardless of Now Playing — and there it is never drawn smaller than that toggle needs, however small the configured Hub is. A Popover, when open, covers it entirely.
 _Avoid_: center dot, puck
+
+**Now Playing**:
+The Hub state, entered whenever Windows reports an active media session, that overrides both the idle dot and a Hovered Item's name — replaced only by Pinned. Shows the session's album art (or the plain Hub background if there is none yet), the Title arc, and the Transport buttons.
+_Avoid_: media mode, now playing widget
+
+**Transport buttons**:
+The previous / play-pause / next trio shown during Now Playing, sitting in the Hub's upper region above the unchanged Gear zone. Unlike every other Menu control, they fire on a left click rather than on releasing the Trigger — the Trigger can stay held throughout.
+_Avoid_: media controls, playback buttons
+
+**Title arc**:
+The current track's title, curved along the Hub's own curvature during Now Playing, truncated with an ellipsis past the available arc length. Hovering it crossfades to the artist's name; moving off crossfades back.
+_Avoid_: media title, now playing label
 
 **Arc**:
 The accent-colored indicator riding just outside the Scrim's edge. Springs (shortest angular path) to point at the Hovered Slot; hidden entirely when Hover is none.
@@ -94,6 +106,9 @@ _Avoid_: close button, exit, OK
 - Every change made while **Pinned** is saved the moment it happens, and what gets saved is what the **Menu** shows — the config file is a recording of the visible state, not a separate truth to reconcile with it
 - Removing an **Item** never touches the **Icon Library**: two Items can share one stored file, so the file outlives the Item that referenced it
 - A **Menu** with no **Slots** at all — no Items, **Dodaj slot** hidden — is a legal state, not a broken one: the **Scrim** and **Hub** still draw, and the **Gear zone** still works, so **Pinned** is always reachable and the user can never lock themselves out
+- **Now Playing** overrides both the idle **Hub** and a **Hovered** Item's name, but **Pinned** overrides it right back — entering Pinned always reclaims the **Hub**, even mid-playback
+- **Transport buttons** are the only Menu controls that respond to a left click instead of releasing the **Trigger**, so they work without letting go of the **Menu**
+- The **Title arc**'s hover region sits inside the **Hub**, where Slot **Hover** is never assigned (per **Dead zone**) — so the artist reveal and a **Hovered** Slot's own feedback never compete for the cursor
 
 ## Example dialogue
 

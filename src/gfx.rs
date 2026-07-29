@@ -6,7 +6,7 @@
 //! shader over three primitive kinds is now three path builders, and what used
 //! to be a glyph atlas on the GPU is a per-glyph blit.
 
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_PI_2, TAU};
 use std::time::Instant;
 
 use cosmic_text::{
@@ -14,17 +14,81 @@ use cosmic_text::{
     SwashCache,
 };
 use tiny_skia::{
-    BlendMode, Color, FillRule, FilterQuality, LineCap, Paint, Path, PathBuilder, Pixmap,
-    PixmapPaint, PremultipliedColorU8, Rect, Stroke, StrokeDash, Transform,
+    BlendMode, Color, FillRule, FilterQuality, LineCap, Paint, Path, PathBuilder, Pattern, Pixmap,
+    PixmapPaint, PremultipliedColorU8, Rect, SpreadMode, Stroke, StrokeDash, Transform,
 };
 use windows::Win32::Foundation::HWND;
 
 use crate::anim::{Animator, FrameModel};
 use crate::config::Config;
-use crate::geometry::MenuGeometry;
+use crate::geometry::{MenuGeometry, TransportButton};
 use crate::icons;
+use crate::media::NowPlaying;
 use crate::popover::{self, PopoverState};
 use crate::present::{self, Layered};
+
+/// Title arc font size, px. Fixed rather than hub_r-relative — it stays
+/// legible at every Hub size; only the available arc width scales with the Hub.
+const TITLE_ARC_PX: f32 = 16.0;
+/// Glyphs are shaped and rasterized this many times larger than they're
+/// drawn, then scaled back down through the same transform that rotates
+/// them. A glyph bitmap rotated 1:1 at its native (tiny) raster size looks
+/// blocky — this gives the rotated bilinear blit enough source pixels to
+/// actually smooth over, the same reason supersampling helps anywhere else.
+const TITLE_ARC_SUPERSAMPLE: f32 = 3.0;
+/// Angular budget the curved title (or artist, on hover) is truncated to,
+/// radians, centered on straight up.
+const TITLE_ARC_SPAN: f32 = 2.35;
+/// Baseline radius the title arc is drawn at, as a fraction of hub_r —
+/// matches the middle of `MenuGeometry::on_title_arc`'s ring.
+const TITLE_ARC_RADIUS_RATIO: f32 = 0.80;
+/// How long the title↔artist crossfade takes to (asymptotically) settle.
+const TITLE_CROSSFADE_S: f32 = 0.15;
+/// Marquee scroll speed, visual px/s, for a title/artist too long for the arc.
+const MARQUEE_PX_S: f32 = 26.0;
+/// How long the marquee dwells at each wall before reversing.
+const MARQUEE_PAUSE_S: f32 = 1.0;
+
+/// A title or artist string too long for the arc scrolls back and forth
+/// between its two walls rather than getting cut off — `pos` is how far
+/// (visual px) it has scrolled from the left wall, clamped to `[0, overflow]`.
+struct Marquee {
+    pos: f32,
+    dir: f32,
+    pause: f32,
+}
+
+impl Default for Marquee {
+    fn default() -> Marquee {
+        Marquee { pos: 0.0, dir: 1.0, pause: 0.0 }
+    }
+}
+
+impl Marquee {
+    /// `overflow` is how far past the available width this frame's text
+    /// runs — 0 (or less) means it fits, and the marquee resets so a newly
+    /// short string doesn't inherit a stale scroll position.
+    fn tick(&mut self, overflow: f32, dt: f32) {
+        if overflow <= 0.5 {
+            *self = Marquee::default();
+            return;
+        }
+        if self.pause > 0.0 {
+            self.pause = (self.pause - dt).max(0.0);
+            return;
+        }
+        self.pos += self.dir * MARQUEE_PX_S * dt;
+        if self.pos >= overflow {
+            self.pos = overflow;
+            self.dir = -1.0;
+            self.pause = MARQUEE_PAUSE_S;
+        } else if self.pos <= 0.0 {
+            self.pos = 0.0;
+            self.dir = 1.0;
+            self.pause = MARQUEE_PAUSE_S;
+        }
+    }
+}
 
 /// Icon inset and tile corner radius, as ratios of tile half-extent, so they
 /// keep their proportions under a configurable tile size instead of drifting.
@@ -89,6 +153,12 @@ pub struct MenuView<'a> {
     /// A Tile is in flight: it follows the cursor instead of its angle, and the
     /// rest have already sprung to the order the drop would produce.
     pub drag: Option<DragView>,
+    /// Current Now Playing snapshot, or None when nothing is Playing/Paused.
+    pub now_playing: Option<&'a NowPlaying>,
+    /// Cursor position, Menu-center-relative px — Transport button and Title
+    /// arc hit-testing both read this directly rather than App precomputing
+    /// them, the same way `draw` already owns every other Hub hit-test.
+    pub cursor_rel: [f32; 2],
 }
 
 /// Popover text buffers, alive only from begin_pin until the next begin_open.
@@ -144,6 +214,33 @@ pub struct Gfx {
     pop: Option<PopBufs>,
     /// Popover icon preview, when the current target yields one.
     pop_icon: Option<Pixmap>,
+
+    /// Now Playing metadata, cloned in whenever `set_now_playing` reports a
+    /// change — only what `draw` needs to render, not a copy of App's copy.
+    now_playing: Option<NowPlaying>,
+    /// Album art, premultiplied; None shows the plain Hub background instead.
+    now_playing_art: Option<Pixmap>,
+    /// Whether `now_playing_art` reads as a dark image overall — picks the
+    /// Transport glyphs' idle color so they stay legible over whatever the
+    /// art happens to be. True (dark) when there is no art, matching the
+    /// plain Hub background's own color.
+    now_playing_art_dark: bool,
+    /// Curved Title arc text — the track title, reshaped on track change.
+    title_buf: TextBuffer,
+    /// Same arc, the artist instead — crossfades in while the arc is hovered.
+    artist_buf: TextBuffer,
+    /// 0 = showing the title, 1 = showing the artist; eases toward whichever
+    /// `tick_render` last saw the Title arc hovered.
+    title_hover_alpha: f32,
+    /// Bounce-scroll state for whichever of title/artist is too long to fit.
+    title_marquee: Marquee,
+    artist_marquee: Marquee,
+    /// Transport button glyphs — static once shaped; the Hub's segmented
+    /// glyphs (gear, toggle, done) already follow this pattern.
+    transport_prev_buf: TextBuffer,
+    transport_next_buf: TextBuffer,
+    transport_play_buf: TextBuffer,
+    transport_pause_buf: TextBuffer,
 
     slots: Vec<Slot>,
     /// The full config, one shape everywhere; visual values read straight off it.
@@ -414,6 +511,169 @@ fn blit_text(
     }
 }
 
+/// One glyph's rasterized coverage, tinted and premultiplied into its own
+/// tiny pixmap so it can be composited with an arbitrary rotation — a single
+/// glyph atlas position has no room to carry a per-glyph transform otherwise.
+fn glyph_pixmap(image: &cosmic_text::SwashImage, rgb: [f32; 3]) -> Option<Pixmap> {
+    let (w, h) = (image.placement.width, image.placement.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut pm = Pixmap::new(w, h)?;
+    let px = pm.pixels_mut();
+    if image.data.len() == (w * h) as usize {
+        // Mask: one coverage byte per pixel — every text glyph takes this path.
+        let (r, g, b) = (
+            (rgb[0].clamp(0.0, 1.0) * 255.0) as u32,
+            (rgb[1].clamp(0.0, 1.0) * 255.0) as u32,
+            (rgb[2].clamp(0.0, 1.0) * 255.0) as u32,
+        );
+        for (dst, &cov) in px.iter_mut().zip(image.data.iter()) {
+            let a = cov as u32;
+            let m = |c: u32| ((c * a + 127) / 255) as u8;
+            *dst = PremultipliedColorU8::from_rgba(m(r), m(g), m(b), cov)
+                .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+        }
+    } else if image.data.len() == (w * h * 4) as usize {
+        // Color (emoji) glyph: already straight-alpha RGBA.
+        for (dst, src) in px.iter_mut().zip(image.data.chunks_exact(4)) {
+            let a = src[3] as u32;
+            let m = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+            *dst = PremultipliedColorU8::from_rgba(m(src[0]), m(src[1]), m(src[2]), src[3])
+                .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+        }
+    } else {
+        return None; // SubpixelMask — not produced by the fonts this draws
+    }
+    Some(pm)
+}
+
+/// Draw `buf`'s single line curved along a circle of `radius` centered on
+/// `center`, within a window `max_w` wide (visual px) centered on straight
+/// up (the Title arc). Each glyph keeps its own shape — only rotated and
+/// translated as a rigid unit — so curvature comes from placement alone,
+/// never from stretching a glyph.
+///
+/// Text short enough to fit is centered in the window. Text that overflows
+/// is shifted left by `marquee_pos` (0..=overflow, the left wall to the
+/// right wall) instead of being truncated — `Marquee::tick` is what drives
+/// that back and forth. Either way, whatever falls outside the window this
+/// frame is clipped rather than drawn wrapping around the rest of the Hub.
+#[allow(clippy::too_many_arguments)]
+fn draw_curved_text(
+    dst: &mut Pixmap,
+    fs: &mut FontSystem,
+    swash: &mut SwashCache,
+    buf: &TextBuffer,
+    center: f32,
+    radius: f32,
+    max_w: f32,
+    marquee_pos: f32,
+    rgb: [f32; 3],
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.004 || radius <= 1.0 {
+        return;
+    }
+    // `buf` was shaped at TITLE_ARC_SUPERSAMPLE times the visual size (see
+    // `shape_full`), so every length coming out of it is divided back down
+    // before it means anything in screen pixels.
+    let total_w = width_of(buf) / TITLE_ARC_SUPERSAMPLE;
+    if total_w <= 0.0 {
+        return;
+    }
+    let overflow = (total_w - max_w).max(0.0);
+    // The window itself never moves; only where the text sits inside it does.
+    let start_phi = -FRAC_PI_2 - (max_w / radius) / 2.0;
+    let end_phi = start_phi + max_w / radius;
+    let shift = if overflow > 0.0 {
+        marquee_pos
+    } else {
+        (total_w - max_w) / 2.0 // negative: centers a short line in the window
+    };
+    let downscale = 1.0 / TITLE_ARC_SUPERSAMPLE;
+    for run in buf.layout_runs() {
+        for glyph in run.glyphs {
+            let phi = start_phi + (glyph.x * downscale - shift) / radius;
+            if phi < start_phi || phi > end_phi {
+                continue; // scrolled (or centered) past the window's edge
+            }
+            // Upright (no rotation) exactly at the top (phi = -PI/2).
+            let rot = phi + FRAC_PI_2;
+            let pg0 = glyph.physical((0.0, 0.0), 1.0);
+            let Some(image) = swash.get_image(fs, pg0.cache_key) else {
+                continue;
+            };
+            let Some(gp) = glyph_pixmap(image, rgb) else {
+                continue;
+            };
+            // Bitmap top-left, relative to the glyph's own pen/baseline point,
+            // in the unrotated frame `physical()` already resolved for us —
+            // scaled down to visual size before it's rotated into place.
+            let local = ((pg0.x as f32 - glyph.x) * downscale, pg0.y as f32 * downscale);
+            let (s, c) = rot.sin_cos();
+            let (rx, ry) = (local.0 * c - local.1 * s, local.0 * s + local.1 * c);
+            let (ax, ay) = (center + radius * phi.cos(), center + radius * phi.sin());
+            dst.draw_pixmap(
+                0,
+                0,
+                gp.as_ref(),
+                &PixmapPaint {
+                    opacity: alpha,
+                    quality: FilterQuality::Bilinear,
+                    ..Default::default()
+                },
+                // The rotation matrix carries the same downscale, so the
+                // oversized source bitmap lands back at its real on-screen size.
+                Transform::from_row(
+                    c * downscale,
+                    s * downscale,
+                    -s * downscale,
+                    c * downscale,
+                    ax + rx,
+                    ay + ry,
+                ),
+                None,
+            );
+        }
+    }
+}
+
+/// Shape `text` at `px` for the Title arc — the whole string, uncut; a
+/// `Marquee` is what handles one too long for the available width now,
+/// not truncation. Shaped at `TITLE_ARC_SUPERSAMPLE` times `px` (see
+/// `draw_curved_text`).
+fn shape_full(fs: &mut FontSystem, px: f32, text: &str) -> TextBuffer {
+    // Bundled font (see Gfx::new), not a system one — always there.
+    let attrs = Attrs::new().family(Family::Name("Inter"));
+    let shape_px = px * TITLE_ARC_SUPERSAMPLE;
+    let mut buf = TextBuffer::new(fs, Metrics::new(shape_px, shape_px * 1.3));
+    buf.set_text(text, &attrs, Shaping::Advanced, None);
+    buf.shape_until_scroll(fs, false);
+    buf
+}
+
+/// Mean perceptual luma over the whole pixmap, 0 (black) to 1 (white) —
+/// transparent pixels are skipped rather than unpremultiplied, since album
+/// art is practically always fully opaque.
+fn average_luma(pm: &Pixmap) -> f32 {
+    let mut sum = 0.0f64;
+    let mut n = 0u64;
+    for p in pm.pixels() {
+        if p.alpha() < 8 {
+            continue;
+        }
+        let (r, g, b) = (p.red() as f64, p.green() as f64, p.blue() as f64);
+        sum += 0.299 * r + 0.587 * g + 0.114 * b;
+        n += 1;
+    }
+    if n == 0 {
+        return 1.0; // fully transparent: treat as light, same as "no art"
+    }
+    (sum / n as f64 / 255.0) as f32
+}
+
 /// A decoded icon, premultiplied once here rather than on every blit.
 fn to_pixmap(icon: &icons::RgbaIcon) -> Option<Pixmap> {
     let mut pm = Pixmap::new(icon.width, icon.height)?;
@@ -457,6 +717,11 @@ impl Gfx {
         }
 
         let mut font_system = FontSystem::new();
+        // Bundled rather than relying on the system: the Title arc's font
+        // shouldn't depend on what happens to be installed.
+        font_system.db_mut().load_font_data(
+            include_bytes!("../assets/fonts/Inter-VariableFont_opsz,wght.ttf").to_vec(),
+        );
         let swash = SwashCache::new();
         // Placeholder metrics: set_items (called at the end of this function)
         // recreates every buffer from the configured label_font_px and seeds
@@ -467,6 +732,12 @@ impl Gfx {
         let remove_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
         let toggle_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
         let done_buf = TextBuffer::new(&mut font_system, Metrics::new(11.0, 14.3));
+        let title_buf = TextBuffer::new(&mut font_system, Metrics::new(TITLE_ARC_PX, TITLE_ARC_PX * 1.3));
+        let artist_buf = TextBuffer::new(&mut font_system, Metrics::new(TITLE_ARC_PX, TITLE_ARC_PX * 1.3));
+        let transport_prev_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
+        let transport_next_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
+        let transport_play_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
+        let transport_pause_buf = TextBuffer::new(&mut font_system, Metrics::new(13.0, 13.0));
 
         let mut gfx = Gfx {
             pixmap,
@@ -482,6 +753,18 @@ impl Gfx {
             done_buf,
             pop: None,
             pop_icon: None,
+            now_playing: None,
+            now_playing_art: None,
+            now_playing_art_dark: true,
+            title_buf,
+            artist_buf,
+            title_hover_alpha: 0.0,
+            title_marquee: Marquee::default(),
+            artist_marquee: Marquee::default(),
+            transport_prev_buf,
+            transport_next_buf,
+            transport_play_buf,
+            transport_pause_buf,
             slots: Vec::new(),
             cfg: cfg.clone(),
             geo,
@@ -533,6 +816,22 @@ impl Gfx {
         );
         self.gear_buf
             .shape_until_scroll(&mut self.font_system, false);
+
+        // Transport button glyphs (Now Playing), sized like the gear glyph but
+        // a touch smaller since three sit side by side instead of one alone.
+        let transport_px = geo.hub_r() * 0.22;
+        let transport_metrics = Metrics::new(transport_px, transport_px);
+        let symbol = Attrs::new().family(Family::Name("Segoe UI Symbol"));
+        let shape_glyph = |fs: &mut FontSystem, ch: &str| {
+            let mut b = TextBuffer::new(fs, transport_metrics);
+            b.set_text(ch, &symbol, Shaping::Advanced, None);
+            b.shape_until_scroll(fs, false);
+            b
+        };
+        self.transport_prev_buf = shape_glyph(&mut self.font_system, "\u{23EE}");
+        self.transport_next_buf = shape_glyph(&mut self.font_system, "\u{23ED}");
+        self.transport_play_buf = shape_glyph(&mut self.font_system, "\u{25B6}");
+        self.transport_pause_buf = shape_glyph(&mut self.font_system, "\u{23F8}");
 
         // Remove control and the Dodaj slot's toggle caption — Pinned-only
         // chrome, sized off the same geometry as everything else.
@@ -723,6 +1022,37 @@ impl Gfx {
         }
     }
 
+    /// A Now Playing state arrived. The title/artist buffers only reshape
+    /// when the track itself changed — a Playing/Paused flip alone reuses
+    /// what's already there, same as `shaped_hover`'s change-gated reshape.
+    pub fn set_now_playing(&mut self, np: Option<&NowPlaying>) {
+        let old_key = self.now_playing.as_ref().map(|n| n.track_key);
+        let new_key = np.map(|n| n.track_key);
+        if new_key != old_key {
+            self.now_playing_art = None; // stale art belonged to the old track
+            let (title, artist) = np.map_or(("", ""), |n| (n.title.as_str(), n.artist.as_str()));
+            self.title_buf = shape_full(&mut self.font_system, TITLE_ARC_PX, title);
+            self.artist_buf = shape_full(&mut self.font_system, TITLE_ARC_PX, artist);
+            // A new string starting mid-scroll would look like it teleported.
+            self.title_marquee = Marquee::default();
+            self.artist_marquee = Marquee::default();
+        }
+        self.now_playing = np.cloned();
+    }
+
+    /// Album art finished decoding (or failed to — `icon: None` either way
+    /// falls back to the plain Hub background, same as a missing Tile icon).
+    pub fn set_now_playing_art(&mut self, icon: Option<&icons::RgbaIcon>) {
+        self.now_playing_art = icon.and_then(to_pixmap);
+        // ponytail: whole-image average, not just the region under the
+        // buttons/title — cheap and right often enough; revisit with a
+        // region sample if a real cover ever picks the wrong side.
+        self.now_playing_art_dark = self
+            .now_playing_art
+            .as_ref()
+            .is_none_or(|pm| average_luma(pm) < 0.5);
+    }
+
     /// Advance the animation and draw one frame.
     pub fn tick_render(&mut self, view: &MenuView) -> Tick {
         let now = Instant::now();
@@ -783,6 +1113,22 @@ impl Gfx {
                 }
             }
             self.shaped_hover = frame.hovered;
+        }
+
+        // Title arc <-> artist crossfade: eases toward whichever the cursor is
+        // over right now. Not a Spring (nothing to overshoot) — a plain
+        // asymptotic ease is the whole animation.
+        let cursor = (view.cursor_rel[0], view.cursor_rel[1]);
+        let title_hovered = view.now_playing.is_some() && self.geo.on_title_arc(cursor);
+        let target = if title_hovered { 1.0 } else { 0.0 };
+        self.title_hover_alpha += (target - self.title_hover_alpha) * (dt / TITLE_CROSSFADE_S).min(1.0);
+
+        if view.now_playing.is_some() {
+            let max_w = TITLE_ARC_SPAN * self.geo.hub_r() * TITLE_ARC_RADIUS_RATIO;
+            let title_w = width_of(&self.title_buf) / TITLE_ARC_SUPERSAMPLE;
+            let artist_w = width_of(&self.artist_buf) / TITLE_ARC_SUPERSAMPLE;
+            self.title_marquee.tick((title_w - max_w).max(0.0), dt);
+            self.artist_marquee.tick((artist_w - max_w).max(0.0), dt);
         }
 
         self.draw(&frame, view);
@@ -1247,8 +1593,112 @@ impl Gfx {
             );
         }
         // The Hub's idle dot / selected name, and the gear glyph, belong to the
-        // press-and-hold Menu. While Pinned the Hub is the toggle's.
-        if !view.editing {
+        // press-and-hold Menu. While Pinned the Hub is the toggle's. Now
+        // Playing (album art, Title arc, Transport buttons) overrides the idle
+        // dot and a Hovered name alike — only Pinned reclaims the Hub from it.
+        if !view.editing && let Some(np) = view.now_playing {
+            let cursor = (view.cursor_rel[0], view.cursor_rel[1]);
+            let hub_hovered = cursor.0 * cursor.0 + cursor.1 * cursor.1 < hub_r * hub_r;
+            let mut art_path = None;
+            if let Some(art) = &self.now_playing_art {
+                let art_r = hub_r - 2.0;
+                if let Some(path) = round_rect(center, center, art_r, art_r, art_r) {
+                    let scale = (art_r * 2.0) / art.width().max(1) as f32;
+                    let mut paint = Paint::default();
+                    paint.anti_alias = true;
+                    paint.shader = Pattern::new(
+                        art.as_ref(),
+                        SpreadMode::Pad,
+                        FilterQuality::Bilinear,
+                        scrim_alpha,
+                        Transform::from_row(scale, 0.0, 0.0, scale, center - art_r, center - art_r),
+                    );
+                    self.pixmap
+                        .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    art_path = Some(path);
+                }
+            }
+            // Dim the cover on hover: a dark overlay on top of the same
+            // circle, not a lower base opacity — that would fade toward
+            // whatever sits behind this translucent window instead of
+            // darkening the art, and it also reads as the Hub's own hover
+            // feedback (matching the accent border elsewhere in the Hub).
+            if hub_hovered && let Some(path) = &art_path {
+                self.pixmap.fill_path(
+                    path,
+                    &paint_of([0.0, 0.0, 0.0], 0.35 * scrim_alpha),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+            let radius = hub_r * TITLE_ARC_RADIUS_RATIO;
+            let arc_max_w = TITLE_ARC_SPAN * radius;
+            let title_color = [1.0, 1.0, 1.0];
+            draw_curved_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.title_buf,
+                center,
+                radius,
+                arc_max_w,
+                self.title_marquee.pos,
+                title_color,
+                scrim_alpha * (1.0 - self.title_hover_alpha),
+            );
+            draw_curved_text(
+                &mut self.pixmap,
+                &mut self.font_system,
+                &mut self.swash,
+                &self.artist_buf,
+                center,
+                radius,
+                arc_max_w,
+                self.artist_marquee.pos,
+                title_color,
+                scrim_alpha * self.title_hover_alpha,
+            );
+
+            let transport_hover = self.geo.transport_button(cursor);
+            // Contrast against whatever the art actually is, not a fixed
+            // gray: a light cover would otherwise wash the glyphs out.
+            let idle_button = if self.now_playing_art_dark {
+                hub_dot
+            } else {
+                [0.102, 0.102, 0.102] // matches the fallback-letter color Tiles use on light icons
+            };
+            let third = hub_r / 3.0;
+            let glyphs: [(f32, &TextBuffer, TransportButton); 3] = [
+                (-third * 2.0, &self.transport_prev_buf, TransportButton::Prev),
+                (
+                    0.0,
+                    if np.playing {
+                        &self.transport_pause_buf
+                    } else {
+                        &self.transport_play_buf
+                    },
+                    TransportButton::PlayPause,
+                ),
+                (third * 2.0, &self.transport_next_buf, TransportButton::Next),
+            ];
+            for (dx, buf, which) in glyphs {
+                let w = width_of(buf);
+                let color = if transport_hover == Some(which) { accent } else { idle_button };
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    buf,
+                    center + dx - w / 2.0,
+                    center - (self.geo.hub_r() * 0.22) * 0.5,
+                    1.0,
+                    color,
+                    scrim_alpha,
+                    None,
+                );
+            }
+        } else if !view.editing {
             let name_w = width_of(&self.hub_label_buf);
             blit_text(
                 &mut self.pixmap,
@@ -1262,21 +1712,21 @@ impl Gfx {
                 scrim_alpha,
                 None,
             );
-        }
-        if hover.is_some() && !view.editing {
-            let sub_w = width_of(&self.hub_sub_buf);
-            blit_text(
-                &mut self.pixmap,
-                &mut self.font_system,
-                &mut self.swash,
-                &self.hub_sub_buf,
-                center - sub_w / 2.0,
-                center + label_font_px * 0.55,
-                1.0,
-                idle_text,
-                scrim_alpha,
-                None,
-            );
+            if hover.is_some() {
+                let sub_w = width_of(&self.hub_sub_buf);
+                blit_text(
+                    &mut self.pixmap,
+                    &mut self.font_system,
+                    &mut self.swash,
+                    &self.hub_sub_buf,
+                    center - sub_w / 2.0,
+                    center + label_font_px * 0.55,
+                    1.0,
+                    idle_text,
+                    scrim_alpha,
+                    None,
+                );
+            }
         }
         // Gear glyph, centered in the Hub's bottom segment.
         if !view.editing {

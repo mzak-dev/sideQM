@@ -16,10 +16,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tiny-skia = "0.11.4"
 tray-icon = "0.24.1"
+# The `windows` crate's Media_Control bindings return this crate's async
+# types directly (not re-exported under `windows::Foundation`), so blocking
+# on them by hand (media.rs's `wait`) needs it as a direct dependency.
+windows-future = "0.3.2"
 # Win32_Security is needed by CreateMutexW and RegCreateKeyExW (both take
 # SECURITY_ATTRIBUTES). It used to arrive for free through wgpu's own feature
 # selection; dropping wgpu made the dependency this crate always had explicit.
-windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemInformation", "Media_Control", "Storage_Streams", "Foundation"] }
 winit = "0.30.13"
 
 [build-dependencies]

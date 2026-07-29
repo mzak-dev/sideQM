@@ -2113,6 +2113,7 @@ dependencies = [
  "tiny-skia",
  "tray-icon",
  "windows",
+ "windows-future",
  "winit",
  "winres",
 ]

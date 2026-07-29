@@ -10,6 +10,7 @@ mod icon_service;
 mod icons;
 mod launch;
 mod logging;
+mod media;
 mod popover;
 mod present;
 
@@ -42,9 +43,10 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::Config;
 use crate::dialog::PickPurpose;
-use crate::geometry::MenuGeometry;
+use crate::geometry::{MenuGeometry, TransportButton};
 use crate::hook::HookEvent;
 use crate::icon_service::{IconKey, IconReady, IconService, JobClass};
+use crate::media::{MediaEvent, MediaService, NowPlaying};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -57,6 +59,8 @@ pub enum AppEvent {
         purpose: PickPurpose,
         path: Option<PathBuf>,
     },
+    /// The media worker reported a Now Playing state or art change.
+    Media(MediaEvent),
 }
 
 struct App {
@@ -69,6 +73,9 @@ struct App {
     tray: Option<TrayIcon>,
     proxy: EventLoopProxy<AppEvent>,
     icons: IconService,
+    media: MediaService,
+    /// Current Now Playing snapshot, or None when nothing is Playing/Paused.
+    now_playing: Option<NowPlaying>,
     /// One key per Item, parallel to cfg.items. An arriving icon is matched
     /// against these rather than against the request that asked for it, so a
     /// config reload mid-decode drops the stale result instead of misplacing it.
@@ -210,6 +217,32 @@ impl App {
                 && let Some(fallback) = fallback
             {
                 g.set_popover_icon(Some(icon), fallback);
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// The media worker reported a state change or a finished art decode.
+    /// Popover/Pinned/idle priority still lives in `gfx`; this just keeps the
+    /// data current and repaints.
+    fn on_media_event(&mut self, ev: MediaEvent) {
+        match ev {
+            MediaEvent::State(np) => {
+                self.now_playing = np;
+                if let Some(g) = &mut self.gfx {
+                    g.set_now_playing(self.now_playing.as_ref());
+                }
+            }
+            MediaEvent::Art { track_key, icon } => {
+                // The track may have moved on while this was decoding; a stale
+                // result just warms nothing instead of landing on the wrong art.
+                if self.now_playing.as_ref().is_some_and(|n| n.track_key == track_key)
+                    && let Some(g) = &mut self.gfx
+                {
+                    g.set_now_playing_art(icon.as_deref());
+                }
             }
         }
         if let Some(w) = &self.window {
@@ -708,6 +741,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.on_file_picked(purpose, path);
                 return;
             }
+            AppEvent::Media(ev) => {
+                self.on_media_event(ev);
+                return;
+            }
         };
         match event {
             HookEvent::TriggerDown { x, y } => {
@@ -795,6 +832,24 @@ impl ApplicationHandler<AppEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Transport buttons (ADR-0008): a left click, not a Trigger
+                // release, and it works during the held-Trigger Menu — the
+                // Trigger is a side button, thumb-held, leaving the index
+                // finger free. Held-only, not Pinned: Now Playing (and these
+                // buttons with it) never draws while Pinned — the Hub belongs
+                // to the Dodaj toggle there, which sits in the same screen
+                // spot the PlayPause button would, and must win the click.
+                if self.now_playing.is_some()
+                    && self.held
+                    && let Some(btn) = self.geo.transport_button(self.cursor_rel)
+                {
+                    self.media.send(match btn {
+                        TransportButton::Prev => media::Command::Prev,
+                        TransportButton::PlayPause => media::Command::PlayPause,
+                        TransportButton::Next => media::Command::Next,
+                    });
+                    return;
+                }
                 if self.pinned.is_some() {
                     let rel = self.cursor_rel;
                     // Clicking away leaves Pinned altogether; anything a
@@ -875,6 +930,8 @@ impl ApplicationHandler<AppEvent> for App {
                         hover_done: pinned.is_some_and(|p| p.hover_done),
                         add_hidden: self.cfg.add_slot.hidden,
                         drag,
+                        now_playing: self.now_playing.as_ref(),
+                        cursor_rel: [self.cursor_rel.0, self.cursor_rel.1],
                     };
                     let tick = g.tick_render(&view);
                     removed = tick.remove_done;
@@ -985,6 +1042,8 @@ fn main() {
         gfx: None,
         tray: None,
         icons: IconService::new(proxy.clone()),
+        media: MediaService::new(proxy.clone()),
+        now_playing: None,
         proxy,
         slot_keys: Vec::new(),
         center: (0.0, 0.0),

@@ -172,7 +172,7 @@ fn rasterize_svg_data(data: &[u8], box_px: u32) -> Result<RgbaImage, IconError> 
 ///
 /// Never upscales: blowing a 32px shell icon up to 256 on the CPU only bakes
 /// in the blur that the GPU's linear sampler would produce anyway.
-fn normalize(img: RgbaImage) -> RgbaIcon {
+pub(crate) fn normalize(img: RgbaImage) -> RgbaIcon {
     let (w, h) = img.dimensions();
     let img = if w.max(h) > ICON_BOX {
         let scale = ICON_BOX as f32 / w.max(h) as f32;

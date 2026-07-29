@@ -153,6 +153,40 @@ impl MenuGeometry {
         dx * dx + dy * dy < hub_r * hub_r && dy > self.gear_cut_dy()
     }
 
+    /// Which Transport button (see Now Playing) sits under the cursor, if any.
+    /// Occupies the Hub minus the Gear zone's chord — everything `in_gear_zone`
+    /// excludes — split into three equal-width vertical strips, left to right.
+    /// Fires on a left click, never on releasing the Trigger, so it does not
+    /// have to dodge the Dead zone the way `hovered_slot` does.
+    pub fn transport_button(&self, p: (f32, f32)) -> Option<TransportButton> {
+        let hub_r = self.hub_r();
+        if p.0 * p.0 + p.1 * p.1 >= hub_r * hub_r
+            || p.1 > self.gear_cut_dy()
+            || self.on_title_arc(p)
+        {
+            return None;
+        }
+        let third = hub_r / 3.0;
+        Some(if p.0 < -third {
+            TransportButton::Prev
+        } else if p.0 > third {
+            TransportButton::Next
+        } else {
+            TransportButton::PlayPause
+        })
+    }
+
+    /// The Title arc's hover region — a band hugging the top inside edge of
+    /// the Hub, where the curved title is actually drawn. Hovering it reveals
+    /// the artist; it never overlaps a Transport button (it sits above them).
+    pub fn on_title_arc(&self, p: (f32, f32)) -> bool {
+        let hub_r = self.hub_r();
+        let d2 = p.0 * p.0 + p.1 * p.1;
+        let outer = hub_r * 0.96;
+        let inner = hub_r * 0.62;
+        d2 <= outer * outer && d2 >= inner * inner && p.1 < -hub_r * 0.3
+    }
+
     /// Which Slot the cursor Hovers, if any.
     ///
     /// The whole wedge is the target: there's no outer edge where selection
@@ -238,6 +272,14 @@ impl MenuGeometry {
         let panel_floor = (popover::PANEL_W.max(popover::PANEL_H) + 24.0) as u32;
         (2 * (self.scrim_r + margin) as u32).max(panel_floor)
     }
+}
+
+/// One of the three Now Playing controls in the Hub's upper region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportButton {
+    Prev,
+    PlayPause,
+    Next,
 }
 
 /// Where Item `i` ends up when the Item at `from` is moved to `to`.
@@ -535,6 +577,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn transport_buttons_split_the_hub_left_to_right() {
+        let g = geo(5); // hub_r = 40, gear chord at +24
+        assert_eq!(g.transport_button((-30.0, 0.0)), Some(TransportButton::Prev));
+        assert_eq!(g.transport_button((0.0, 0.0)), Some(TransportButton::PlayPause));
+        assert_eq!(g.transport_button((30.0, 0.0)), Some(TransportButton::Next));
+        // Outside the Hub entirely: no button.
+        assert_eq!(g.transport_button((0.0, -100.0)), None);
+        // Inside the Gear zone (below the chord): not a Transport button.
+        assert_eq!(g.transport_button((0.0, 30.0)), None);
+    }
+
+    #[test]
+    fn transport_buttons_never_reach_into_the_gear_zone() {
+        // Every point the Gear zone claims must be a non-button, at several
+        // Hub sizes, so the two controls never fight over the same pixel.
+        for (scrim, ratio) in [(200.0, 0.2), (80.0, 0.05), (600.0, 0.5)] {
+            let g = MenuGeometry { scrim_r: scrim, hub_ratio: ratio, ..geo(5) };
+            let r = g.hub_r();
+            for i in 0..20 {
+                let a = i as f32 / 20.0 * TAU;
+                let p = (a.cos() * r * 0.99, a.sin() * r * 0.99);
+                if g.in_gear_zone((p.0 as f64, p.1 as f64), (0.0, 0.0)) {
+                    assert!(g.transport_button(p).is_none(), "{p:?} scrim {scrim} ratio {ratio}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn title_arc_sits_above_the_transport_buttons() {
+        let g = geo(5); // hub_r = 40
+        // Straight up, inside the ring: the arc's own region.
+        assert!(g.on_title_arc((0.0, -30.0)));
+        // Same point is never also read as a Transport button.
+        assert_eq!(g.transport_button((0.0, -30.0)), None);
+        // Dead center and the Gear zone: not the title arc.
+        assert!(!g.on_title_arc((0.0, 0.0)));
+        assert!(!g.on_title_arc((0.0, 30.0)));
+        // Outside the Hub entirely: not the title arc.
+        assert!(!g.on_title_arc((0.0, -100.0)));
     }
 
     fn angle_point(deg: f32, r: f32) -> (f64, f64) {

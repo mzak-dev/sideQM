@@ -14,8 +14,8 @@ use cosmic_text::{
     SwashCache,
 };
 use tiny_skia::{
-    BlendMode, Color, FillRule, FilterQuality, LineCap, Paint, Path, PathBuilder, Pattern, Pixmap,
-    PixmapPaint, PremultipliedColorU8, Rect, SpreadMode, Stroke, StrokeDash, Transform,
+    BlendMode, Color, FillRule, FilterQuality, LineCap, Mask, Paint, Path, PathBuilder, Pixmap,
+    PixmapPaint, PremultipliedColorU8, Rect, Stroke, StrokeDash, Transform,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -220,6 +220,10 @@ pub struct Gfx {
     now_playing: Option<NowPlaying>,
     /// Album art, premultiplied; None shows the plain Hub background instead.
     now_playing_art: Option<Pixmap>,
+    /// Circular clip the cover is drawn through, with the (width, height,
+    /// radius-bits) it was built for — see the draw site for why the cover is
+    /// masked rather than filled with a `Pattern`.
+    art_mask: Option<((u32, u32, u32), Mask)>,
     /// Whether `now_playing_art` reads as a dark image overall — picks the
     /// Transport glyphs' idle color so they stay legible over whatever the
     /// art happens to be. True (dark) when there is no art, matching the
@@ -654,19 +658,29 @@ fn shape_full(fs: &mut FontSystem, px: f32, text: &str) -> TextBuffer {
     buf
 }
 
-/// Mean perceptual luma over the whole pixmap, 0 (black) to 1 (white) —
-/// transparent pixels are skipped rather than unpremultiplied, since album
-/// art is practically always fully opaque.
+/// Mean perceptual luma across the horizontal band the Transport glyphs
+/// actually sit in (middle fifth of the art's height, full width), 0 (black)
+/// to 1 (white) — transparent pixels are skipped rather than unpremultiplied,
+/// since album art is practically always fully opaque. A whole-cover average
+/// picks the wrong contrast whenever the art is dark at the edges and light
+/// through the middle (or vice versa); sampling the actual strip under the
+/// buttons is what needs to be legible, not the cover as a whole.
 fn average_luma(pm: &Pixmap) -> f32 {
+    let (w, h) = (pm.width() as usize, pm.height() as usize);
+    let y0 = h * 2 / 5;
+    let y1 = (h * 3 / 5).max(y0 + 1).min(h);
+    let pixels = pm.pixels();
     let mut sum = 0.0f64;
     let mut n = 0u64;
-    for p in pm.pixels() {
-        if p.alpha() < 8 {
-            continue;
+    for y in y0..y1 {
+        for p in &pixels[y * w..(y + 1) * w] {
+            if p.alpha() < 8 {
+                continue;
+            }
+            let (r, g, b) = (p.red() as f64, p.green() as f64, p.blue() as f64);
+            sum += 0.299 * r + 0.587 * g + 0.114 * b;
+            n += 1;
         }
-        let (r, g, b) = (p.red() as f64, p.green() as f64, p.blue() as f64);
-        sum += 0.299 * r + 0.587 * g + 0.114 * b;
-        n += 1;
     }
     if n == 0 {
         return 1.0; // fully transparent: treat as light, same as "no art"
@@ -755,6 +769,7 @@ impl Gfx {
             pop_icon: None,
             now_playing: None,
             now_playing_art: None,
+            art_mask: None,
             now_playing_art_dark: true,
             title_buf,
             artist_buf,
@@ -1210,6 +1225,16 @@ impl Gfx {
         } else {
             self.geo.hub_r()
         };
+        // The cover fills the Hub edge to edge, so its own anti-aliased
+        // silhouette *is* the Hub's edge. Drawing a border as well puts a
+        // second, brighter ring just outside the first with bare hub_bg
+        // between — a detached hairline hugging the cover, which is what reads
+        // as "the outline of the album art" as the Menu fades (every term here
+        // is linear in scrim_alpha, so it never fades out of that ordering).
+        // Kept as a plain bool: it must not hold a borrow of self across the
+        // &mut self.pixmap calls below.
+        let hub_has_art =
+            !view.editing && view.now_playing.is_some() && self.now_playing_art.is_some();
 
         // Per-slot animated values: (position, scale, alpha). Tiles sit at
         // rest_r on their sprung angle — except the one being dragged, which
@@ -1255,12 +1280,19 @@ impl Gfx {
             hub_r,
             hub_r,
             hub_r,
-            (hub_bg, scrim_alpha),
-            Some((
-                1.2,
-                if hover.is_some() { accent } else { white },
-                (if hover.is_some() { 0.45 } else { 0.10 }) * scrim_alpha,
-            )),
+            // Fill skipped too when the cover is about to cover it: sharing a
+            // radius would composite both anti-aliased feathers, making the
+            // edge *more* opaque than either layer alone — a bright rim of its
+            // own. The cover is opaque, so the fill under it only ever showed
+            // at that feather.
+            (hub_bg, if hub_has_art { 0.0 } else { scrim_alpha }),
+            (!hub_has_art).then(|| {
+                (
+                    1.2,
+                    if hover.is_some() { accent } else { white },
+                    (if hover.is_some() { 0.45 } else { 0.10 }) * scrim_alpha,
+                )
+            }),
             0.0,
         );
         // Gear zone: the Hub's bottom segment; release there enters Pinned.
@@ -1601,20 +1633,48 @@ impl Gfx {
             let hub_hovered = cursor.0 * cursor.0 + cursor.1 * cursor.1 < hub_r * hub_r;
             let mut art_path = None;
             if let Some(art) = &self.now_playing_art {
-                let art_r = hub_r - 2.0;
+                // Flush with the Hub: no border is drawn while art is showing
+                // (see hub_has_art), so this edge is the Hub's own.
+                let art_r = hub_r;
                 if let Some(path) = round_rect(center, center, art_r, art_r, art_r) {
-                    let scale = (art_r * 2.0) / art.width().max(1) as f32;
-                    let mut paint = Paint::default();
-                    paint.anti_alias = true;
-                    paint.shader = Pattern::new(
-                        art.as_ref(),
-                        SpreadMode::Pad,
-                        FilterQuality::Bilinear,
-                        scrim_alpha,
-                        Transform::from_row(scale, 0.0, 0.0, scale, center - art_r, center - art_r),
-                    );
-                    self.pixmap
-                        .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    // A masked `draw_pixmap` rather than a `Pattern` shader:
+                    // feeding the fade into `Pattern`'s own opacity makes the
+                    // anti-aliased edge come out *more* opaque than the
+                    // requested alpha, leaving a bright 1px rim around the
+                    // cover at mid-fade. Masking keeps the fade in
+                    // `PixmapPaint::opacity`, exactly as draw_icon does, and
+                    // the edge falls off cleanly. The mask only changes with
+                    // the Hub radius or the window, so it is cached rather
+                    // than re-rasterized sixty times a second.
+                    let key = (self.pixmap.width(), self.pixmap.height(), art_r.to_bits());
+                    if self.art_mask.as_ref().map(|(k, _)| *k) != Some(key) {
+                        self.art_mask = Mask::new(key.0, key.1).map(|mut m| {
+                            m.fill_path(&path, FillRule::Winding, true, Transform::identity());
+                            (key, m)
+                        });
+                    }
+                    if let Some((_, mask)) = &self.art_mask {
+                        let scale = (art_r * 2.0) / art.width().max(1) as f32;
+                        self.pixmap.draw_pixmap(
+                            0,
+                            0,
+                            art.as_ref(),
+                            &PixmapPaint {
+                                opacity: scrim_alpha.clamp(0.0, 1.0),
+                                quality: FilterQuality::Bilinear,
+                                ..Default::default()
+                            },
+                            Transform::from_row(
+                                scale,
+                                0.0,
+                                0.0,
+                                scale,
+                                center - art_r,
+                                center - art_r,
+                            ),
+                            Some(mask),
+                        );
+                    }
                     art_path = Some(path);
                 }
             }
@@ -1662,9 +1722,12 @@ impl Gfx {
 
             let transport_hover = self.geo.transport_button(cursor);
             // Contrast against whatever the art actually is, not a fixed
-            // gray: a light cover would otherwise wash the glyphs out.
+            // gray: a light cover would otherwise wash the glyphs out. Full
+            // white/near-black rather than hub_dot's mid-gray — plenty of
+            // covers sit in the middle of the brightness range, where a
+            // mid-gray button all but disappears against them too.
             let idle_button = if self.now_playing_art_dark {
-                hub_dot
+                white
             } else {
                 [0.102, 0.102, 0.102] // matches the fallback-letter color Tiles use on light icons
             };
@@ -1940,6 +2003,104 @@ mod tests {
 
         // Zero radius is a plain rect, not an empty path.
         assert!(round_rect(0.0, 0.0, 5.0, 5.0, 0.0).is_some());
+    }
+
+    /// Transport button contrast reads the strip the glyphs sit in, not the
+    /// whole cover — a cover that's dark everywhere except that middle band
+    /// must still be judged light there.
+    #[test]
+    fn average_luma_samples_the_middle_band_only() {
+        let mut pm = Pixmap::new(10, 10).unwrap();
+        pm.fill(tiny_skia::Color::BLACK);
+        // Middle fifth (rows 4..6) painted white; everything else stays black.
+        let w = pm.width() as usize;
+        let px = pm.pixels_mut();
+        for y in 4..6usize {
+            for x in 0..w {
+                px[y * w + x] = tiny_skia::PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+            }
+        }
+        assert!(average_luma(&pm) > 0.9, "should read the white band as light");
+    }
+
+    /// Mean premultiplied luma around one ring. Premultiplied color over black
+    /// is just the color, so this is what a dark desktop actually shows through
+    /// the layered window.
+    fn ring_luma(pm: &Pixmap, c: f32, r: f32) -> f32 {
+        let (w, px) = (pm.width() as usize, pm.pixels());
+        let n = 720;
+        let mut sum = 0.0f32;
+        for i in 0..n {
+            let a = i as f32 / n as f32 * TAU;
+            let (x, y) = ((c + a.cos() * r) as usize, (c + a.sin() * r) as usize);
+            let p = px[y * w + x];
+            sum += 0.299 * p.red() as f32 + 0.587 * p.green() as f32 + 0.114 * p.blue() as f32;
+        }
+        sum / n as f32 / 255.0
+    }
+
+    /// A cover must not leave a brighter ring behind it. The Hub's border used
+    /// to sit 0.8px outside the cover's edge with bare `hub_bg` between, so the
+    /// radial profile went cover -> dark moat -> bright hairline: a detached
+    /// ring hugging the art, which is what read as "the outline of the album
+    /// art stayed" while the Menu faded. Every term here is linear in
+    /// `scrim_alpha`, so the ordering is the same at every point of the fade —
+    /// hence monotonicity, not a brightness threshold, is the invariant.
+    /// Mirrors the two calls `draw` makes for the Hub disc and the cover.
+    /// `cargo test hub_rim -- --nocapture` prints the profile.
+    #[test]
+    fn a_cover_leaves_no_brighter_ring_at_the_hub_rim() {
+        const HUB_R: f32 = 39.2; // radius_px 140 * hub_ratio 0.28
+        let c = 60.0f32;
+        let mut cover = Pixmap::new(64, 64).unwrap();
+        cover.fill(Color::from_rgba8(240, 240, 240, 255)); // far brighter than hub_bg
+
+        for &s in &[0.91f32, 0.6, 0.35, 0.2, 0.1, 0.05] {
+            let mut pm = Pixmap::new(120, 120).unwrap();
+            box_shape(
+                &mut pm,
+                c,
+                c,
+                HUB_R,
+                HUB_R,
+                HUB_R,
+                ([0.063, 0.071, 0.086], 0.0), // fill and border both skipped
+                None,
+                0.0,
+            );
+            let art_r = HUB_R;
+            let path = round_rect(c, c, art_r, art_r, art_r).unwrap();
+            let scale = (art_r * 2.0) / cover.width() as f32;
+            let mut mask = Mask::new(120, 120).unwrap();
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            pm.draw_pixmap(
+                0,
+                0,
+                cover.as_ref(),
+                &PixmapPaint {
+                    opacity: s,
+                    quality: FilterQuality::Bilinear,
+                    ..Default::default()
+                },
+                Transform::from_row(scale, 0.0, 0.0, scale, c - art_r, c - art_r),
+                Some(&mask),
+            );
+
+            let prof: Vec<f32> = (0..25)
+                .map(|i| HUB_R - 4.0 + i as f32 * 0.25)
+                .map(|r| ring_luma(&pm, c, r))
+                .collect();
+            println!(
+                "scrim {s:.2}: {:?}",
+                prof.iter().map(|v| (v * 255.0).round() as i32).collect::<Vec<_>>()
+            );
+            for w in prof.windows(2) {
+                assert!(
+                    w[1] <= w[0] + 1.5 / 255.0,
+                    "brighter ring outside the cover at scrim {s:.2}: {prof:?}"
+                );
+            }
+        }
     }
 
     #[test]

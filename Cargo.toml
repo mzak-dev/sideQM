@@ -1,6 +1,6 @@
 [package]
 name = "sideqm"
-version = "0.5.15"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]

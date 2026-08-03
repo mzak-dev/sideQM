@@ -94,11 +94,11 @@ cargo test
 ```
 
 CI builds and tests on `windows-latest` for every PR to `master`
-([rust.yml](.github/workflows/rust.yml)). Merging to `master` re-runs the tests
-in release mode and, if the `version` in `Cargo.toml` has no matching GitHub
-release yet, publishes one with the built binary
-([release.yml](.github/workflows/release.yml)). So cutting a release is a
-version bump in `Cargo.toml` — no tagging by hand.
+([rust.yml](.github/workflows/rust.yml)). Publishing is handled by the manual
+Release workflow
+([release.yml](.github/workflows/release.yml)): run it from the Actions tab
+after bumping `version` in `Cargo.toml` to cut a new GitHub release (no
+tagging by hand).
 
 - [`CONTEXT.md`](CONTEXT.md) — domain glossary (Menu, Trigger, Slot, Hover, Arc, ...)
 - [`docs/adr/`](docs/adr) — architecture decisions (e.g. why rendering is done on the CPU)
